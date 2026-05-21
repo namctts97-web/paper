@@ -28,12 +28,12 @@ class Residual_ActorCritic(nn.Module):
         self.actor = nn.Sequential(
             nn.Linear(feature_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, action_dim)
-            # 【核心修正】：删掉 nn.Tanh()，打破边界死锁！允许 Residual 产生足够大的值去反杀 Prior
+            nn.Linear(64, action_dim),
+            nn.Tanh() # <--- 【核心修改】：强制右脑输出在 [-1, 1] 之间！
         )
-        # 初始化索引改为 -1 (因为去掉了 Tanh)
-        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
-        nn.init.constant_(self.actor[-1].bias, 0.0)
+        # 初始化最后一个线性层 (现在索引是 -2)
+        nn.init.orthogonal_(self.actor[-2].weight, gain=0.01)
+        nn.init.constant_(self.actor[-2].bias, 0.0)
         
         # Centralized Critic: 接收展平的 (N*6) 维全战局信息，统揽全局
         self.critic = nn.Sequential(
@@ -50,7 +50,7 @@ class ResidualPPOAgent:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
-        self.residual_scale = 2.0 # 退回 2.0，避免过度放大标将导致策略崩溃
+        self.residual_scale = 5.0 # <--- 【核心修改】：右脑被锁后，赋予 5.0 的反杀权重
         
         # 强制使用 CPU (规避 RTX 5070 的 sm_120 兼容性报错)
         self.device = torch.device("cpu")
@@ -77,20 +77,23 @@ class ResidualPPOAgent:
         N = state.shape[0]
         with torch.no_grad():
             # 1. 左脑本能 (提取前4维特征)
-            prior_x = state[:, :4].clone() # shape: (6, 4)
-            # 【护目镜】：截断 D_i (索引2) 防止 OOD 击穿冻结的网络
+            prior_x = state[:, :4].clone() 
             prior_x[:, 2] = torch.clamp(prior_x[:, 2], max=5.0)
-            logits_prior = self.prior_net(prior_x) # shape: (6, 4)
+            logits_prior = self.prior_net(prior_x)
+            
+            # <--- 【核心修改】：限制老专家固执度
+            logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
             # 2. 右脑修正 (完整6维特征)
-            delta_logits = self.residual_net.actor(state) # shape: (6, 4)
+            delta_logits = self.residual_net.actor(state)
             
             # 融合 (基于 ablation_mode)
             if self.ablation_mode == 'prior':
                 logits_final = logits_prior.clone()
                 brain_wave = torch.abs(delta_logits).mean(dim=0).cpu().numpy()
             elif self.ablation_mode == 'ppo':
-                logits_final = delta_logits.clone()
+                # <--- 【核心修改】：纯 PPO 模式也要乘 scale
+                logits_final = self.residual_scale * delta_logits.clone() 
                 brain_wave = torch.abs(delta_logits).mean(dim=0).cpu().numpy()
             else: # residual
                 logits_final = logits_prior + self.residual_scale * delta_logits
@@ -140,18 +143,21 @@ class ResidualPPOAgent:
             N = states.shape[1]
             
             # 1. 批量重塑送入左脑
-            prior_states = states[:, :, :4].contiguous().view(-1, 4).clone() # (batch*6, 4)
+            prior_states = states[:, :, :4].contiguous().view(-1, 4).clone()
             prior_states[:, 2] = torch.clamp(prior_states[:, 2], max=5.0)
             logits_prior = self.prior_net(prior_states).view(batch_size, N, 4)
             
-            # 2. 批量重塑送入右脑 Actor (切断串扰！)
-            actor_x = states.view(-1, 6) # (batch*6, 6)
+            # <--- 【核心修改】：训练时同样限制老专家
+            logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
+            
+            # 2. 批量重塑送入右脑 Actor
+            actor_x = states.view(-1, 6)
             delta_logits = self.residual_net.actor(actor_x).view(batch_size, N, 4)
             
             if self.ablation_mode == 'prior':
                 logits_final = logits_prior.clone()
             elif self.ablation_mode == 'ppo':
-                logits_final = delta_logits.clone()
+                logits_final = self.residual_scale * delta_logits.clone() # <--- 记得乘 scale
             else:
                 logits_final = logits_prior + self.residual_scale * delta_logits
             
@@ -175,7 +181,16 @@ class ResidualPPOAgent:
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
             
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values.squeeze(), returns) - 0.01 * dist_entropy
+            # ==========================================
+            # 核心手术 2：引入右脑休眠惩罚 L2 Regularization
+            # ==========================================
+            l2_penalty = (delta_logits ** 2).mean()
+            
+            # 仅在双脑模式下，强迫右脑平时休眠
+            if self.ablation_mode == 'residual':
+                loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values.squeeze(), returns) - 0.01 * dist_entropy + 0.05 * l2_penalty
+            else:
+                loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values.squeeze(), returns) - 0.01 * dist_entropy
             
             self.optimizer.zero_grad()
             loss.mean().backward()

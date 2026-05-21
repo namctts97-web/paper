@@ -174,6 +174,17 @@ class ResidualIoVEnv(gym.Env):
         # 4. 计算真实延迟与能耗 (所有判断必须是 legal_actions)
         total_cost = 0
         actual_load_cycles = 0
+        total_latency = 0
+        
+        # ==========================================
+        # 核心手术 1：引入回传带宽拥塞共享
+        # ==========================================
+        count_offsite = sum(1 for a in legal_actions if a == 2)
+        count_cloud = sum(1 for a in legal_actions if a == 3)
+        
+        shared_r_eo = self.r_eo / count_offsite if count_offsite > 0 else self.r_eo
+        shared_r_ec = self.r_ec / count_cloud if count_cloud > 0 else self.r_ec
+        # ==========================================
         
         # 统计选择本地 MEC 和远程 MEC 的车辆数，用于 Convex 算力分配 (与专家一致)
         idx_mec = np.where(np.array(legal_actions) == 1)[0]
@@ -190,7 +201,6 @@ class ResidualIoVEnv(gym.Env):
             for idx in idx_offsite:
                 f_assigned[idx] = self.f_offsite * (math.sqrt(self.vehicles[idx].D_i) / sum_sqrt_D)
             
-        total_latency = 0
         for i, v in enumerate(self.vehicles):
             h_t = self.calculate_fading_rate(v)
             # 大尺度路损: 127 + 30 * log10(d_km)
@@ -214,12 +224,12 @@ class ResidualIoVEnv(gym.Env):
                 E_i = self.p_i * T_trans
                 actual_load_cycles += D
             elif legal_actions[i] == 2:
-                T_trans = U / rate + U / self.r_eo + self.prop_eo
+                T_trans = U / rate + U / shared_r_eo + self.prop_eo
                 T_exec = D / f_assigned[i]
                 T_i = T_trans + T_exec
                 E_i = self.p_i * (U / rate)
             elif legal_actions[i] == 3:
-                T_trans = U / rate + U / self.r_ec + self.prop_ec
+                T_trans = U / rate + U / shared_r_ec + self.prop_ec
                 T_exec = D / self.f_cloud
                 T_i = T_trans + T_exec
                 E_i = self.p_i * (U / rate)
