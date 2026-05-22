@@ -28,12 +28,12 @@ class Residual_ActorCritic(nn.Module):
         self.actor = nn.Sequential(
             nn.Linear(feature_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, action_dim)
-            # 【核心修正】：删掉 nn.Tanh()，打破边界死锁！允许 Residual 产生足够大的值去反杀 Prior
+            nn.Linear(64, action_dim),
+            nn.Tanh() # 导师修改：恢复 Tanh，通过外层 residual_scale 缩放，严防 Logit 爆炸
         )
-        # 初始化索引改为 -1 (因为去掉了 Tanh)
-        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
-        nn.init.constant_(self.actor[-1].bias, 0.0)
+        # 初始化索引改回 -2 (因为加回了 Tanh)
+        nn.init.orthogonal_(self.actor[-2].weight, gain=0.01)
+        nn.init.constant_(self.actor[-2].bias, 0.0)
         
         # Centralized Critic: 接收展平的 (N*6) 维全战局信息，统揽全局
         self.critic = nn.Sequential(
@@ -49,7 +49,7 @@ class ResidualPPOAgent:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
-        self.residual_scale = 2.0 # 退回 2.0，避免过度放大标将导致策略崩溃
+        self.residual_scale = 15.0 # 导师修正：赋予右脑一票否决权！允许输出足够的 Logit 差来推翻先验网络的愚蠢决定
         
         # 强制使用 CPU (规避 RTX 5070 的 sm_120 兼容性报错)
         self.device = torch.device("cpu")
@@ -64,9 +64,11 @@ class ResidualPPOAgent:
             
         # 任务 2: 定义 CTDE 残差策略网络 并移动到设备
         self.residual_net = Residual_ActorCritic(N_vehicles=6, feature_dim=6, action_dim=4).to(self.device)
-        
         self.optimizer = optim.Adam(self.residual_net.parameters(), lr=lr)
         self.MseLoss = nn.MSELoss()
+        
+        # 情景记忆池 (用于 ER-CL 抵抗灾难性遗忘)
+        self.ood_memory = []
         
         self.buffer = []
 
@@ -81,8 +83,16 @@ class ResidualPPOAgent:
             prior_x[:, 2] = torch.clamp(prior_x[:, 2], max=5.0)
             logits_prior = self.prior_net(prior_x) # shape: (6, 4)
             
+            # 导师修正：动态 OOD 抑制器！如果发现 D_i 异常庞大(>5.0)，说明发生洪峰
+            # 此时先验专家就是个庸医，直接将其输出权重归零，由右脑全面接管！
+            ood_mask = (state[:, 2] > 5.0).float().unsqueeze(1)
+            logits_prior = logits_prior * (1.0 - ood_mask)
+            
             # 2. 右脑修正 (完整6维特征)
-            delta_logits = self.residual_net.actor(state) # shape: (6, 4)
+            # 导师修改：为右脑增加 OOD 特征护目镜，防止流量洪峰击穿网络
+            actor_x = state.clone()
+            actor_x[:, 2] = torch.clamp(actor_x[:, 2], max=5.0)
+            delta_logits = self.residual_net.actor(actor_x) # shape: (6, 4)
             
             # 融合
             logits_final = logits_prior + self.residual_scale * delta_logits # shape: (6, 4)
@@ -122,6 +132,33 @@ class ResidualPPOAgent:
             returns.insert(0, discounted_reward)
             
         returns = torch.FloatTensor(returns).to(self.device)
+        
+        # === ER-CL: 提取与存储高价值 OOD 记忆 ===
+        import random
+        for i in range(len(states)):
+            if states[i, 0, 2] > 5.0:  # 检测到 OOD 状态
+                self.ood_memory.append((states[i].cpu(), actions[i].cpu(), old_logprobs[i].cpu(), returns[i].cpu()))
+        # 维护记忆池容量上限
+        if len(self.ood_memory) > 2000:
+            self.ood_memory = self.ood_memory[-2000:]
+            
+        # === ER-CL: 时空穿梭混合采样 ===
+        # 如果当前处于“和平年代”（当前 Batch 缺乏 OOD），且记忆库充足，注入历史灾难记忆
+        current_ood_count = sum([1 for i in range(len(states)) if states[i, 0, 2] > 5.0])
+        if current_ood_count < len(states) * 0.1 and len(self.ood_memory) > 100:
+            sample_size = int(len(states) * 0.2)  # 混入 20% 的灾难样本
+            sampled = random.sample(self.ood_memory, sample_size)
+            
+            s_states = torch.stack([s[0] for s in sampled]).to(self.device)
+            s_actions = torch.stack([s[1] for s in sampled]).to(self.device)
+            s_old_logprobs = torch.stack([s[2] for s in sampled]).to(self.device)
+            s_returns = torch.stack([s[3] for s in sampled]).to(self.device)
+            
+            states = torch.cat([states, s_states], dim=0)
+            actions = torch.cat([actions, s_actions], dim=0)
+            old_logprobs = torch.cat([old_logprobs, s_old_logprobs], dim=0)
+            returns = torch.cat([returns, s_returns], dim=0)
+            
         # ！！！【核心修复 1】：彻底删掉对 returns 的归一化代码！！！
         
         # PPO 优化循环
@@ -135,8 +172,14 @@ class ResidualPPOAgent:
             prior_states[:, 2] = torch.clamp(prior_states[:, 2], max=5.0)
             logits_prior = self.prior_net(prior_states).view(batch_size, N, 4)
             
+            # 同步在训练时应用 OOD 抑制器
+            ood_mask_batch = (states[:, :, 2] > 5.0).float().unsqueeze(-1) # (batch, N, 1)
+            logits_prior = logits_prior * (1.0 - ood_mask_batch)
+            
             # 2. 批量重塑送入右脑 Actor (切断串扰！)
-            actor_x = states.view(-1, 6) # (batch*6, 6)
+            actor_x = states.view(-1, 6).clone() # (batch*6, 6)
+            # 导师修改：同步在 Update 时截断 OOD 特征
+            actor_x[:, 2] = torch.clamp(actor_x[:, 2], max=5.0)
             delta_logits = self.residual_net.actor(actor_x).view(batch_size, N, 4)
             
             logits_final = logits_prior + self.residual_scale * delta_logits

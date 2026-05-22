@@ -133,27 +133,38 @@ class ResidualIoVEnv(gym.Env):
         return max(1e-3, abs(vehicle.h_t))
 
     def apply_kkt_projection(self, raw_actions):
-        """KKT 算力投影 (贪心背包装箱修复版：拯救归零的 MEC 负载)"""
-        capacity_limit = self.f_mec * self.T_max
+        """KKT 算力投影 (重构版：合理的容量检测与本地降级策略)"""
         legal_actions = np.copy(raw_actions)
         
-        # 提取想要去 MEC 的车辆索引
-        offload_indices = [i for i, action in enumerate(raw_actions) if action == 1]
-                
-        # 核心修正：按 QoS (lambda_i) 降序排列！优先让最怕延迟的高优 URLLC 尝试接入
-        sorted_indices = sorted(offload_indices, key=lambda idx: self.vehicles[idx].lambda_i, reverse=True)
+        # Local MEC 容量管理
+        capacity_limit_local = self.f_mec * self.T_max
+        offload_indices_local = [i for i, action in enumerate(raw_actions) if action == 1]
+        sorted_indices_local = sorted(offload_indices_local, key=lambda idx: self.vehicles[idx].lambda_i, reverse=True)
         
-        # 先将所有想去本地 MEC 的任务默认重定向到算力无限的云端 (Action 3)
-        for idx in offload_indices:
-            legal_actions[idx] = 3
-            
-        accepted_workload = 0
-        for idx in sorted_indices:
+        accepted_workload_local = 0
+        for idx in sorted_indices_local:
             task_D = self.vehicles[idx].D_i
-            # 贪心装箱：只要当前任务还能塞得下 MEC，就接受它！拒绝同归于尽！
-            if accepted_workload + task_D <= capacity_limit:
-                legal_actions[idx] = 1 # 准许接入 MEC
-                accepted_workload += task_D
+            if accepted_workload_local + task_D <= capacity_limit_local:
+                legal_actions[idx] = 1
+                accepted_workload_local += task_D
+            else:
+                # 导师修改：灾难下 Local MEC 挤爆时，强制退回本地计算 (0)，严禁排队云端 (3)
+                legal_actions[idx] = 0
+
+        # Remote MEC 容量管理
+        capacity_limit_remote = self.f_offsite * self.T_max
+        offload_indices_remote = [i for i, action in enumerate(raw_actions) if action == 2]
+        sorted_indices_remote = sorted(offload_indices_remote, key=lambda idx: self.vehicles[idx].lambda_i, reverse=True)
+        
+        accepted_workload_remote = 0
+        for idx in sorted_indices_remote:
+            task_D = self.vehicles[idx].D_i
+            if accepted_workload_remote + task_D <= capacity_limit_remote:
+                legal_actions[idx] = 2
+                accepted_workload_remote += task_D
+            else:
+                # 导师修改：Remote MEC 挤爆时，同样强制退回本地计算 (0)
+                legal_actions[idx] = 0
                 
         return legal_actions
 
@@ -307,3 +318,16 @@ class ResidualIoVEnv(gym.Env):
         self.is_flood_triggered = True
         self._apply_disaster_state()
         print("\n[EVENT] CRITICAL: Traffic Flood Triggered! Task Workload x10")
+
+    def recover_from_avalanche(self):
+        """恢复算力雪崩"""
+        self.is_avalanche_triggered = False
+        self.f_mec = self.params['f_mec']
+        for es in self.edge_servers:
+            es.cpu = self.f_mec
+        print("\n[EVENT] RECOVERY: Capacity Avalanche Resolved! MEC Capacity -> 28GHz")
+
+    def recover_from_flood(self):
+        """恢复流量洪峰"""
+        self.is_flood_triggered = False
+        print("\n[EVENT] RECOVERY: Traffic Flood Resolved! Task Workload Normal")

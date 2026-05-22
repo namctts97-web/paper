@@ -32,6 +32,7 @@ def train():
     history_mec_load = []
     # 新增：记录四个动作在每轮的使用比例
     history_action_ratios = {0: [], 1: [], 2: [], 3: []}
+    history_raw_action_ratios = {0: [], 1: [], 2: [], 3: []}
     
     for episode in range(1, max_episodes + 1):
         # 动态衰减学习率 (Linear LR Decay)
@@ -43,14 +44,17 @@ def train():
         state = env.reset()
         episode_reward = 0
         action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        raw_action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
         
-        # OOD 灾难触发 (在训练一半时触发)
-        if episode == 1000:
-            print("\n" + "!"*30)
-            print("WARNING: OOD Disaster Triggered!")
+        # OOD 灾难触发与恢复 (非平稳测试)
+        if episode == 500 or episode == 1300:
+            print(f"\n{'!'*30}\nWARNING: OOD Disaster Triggered at Ep {episode}!\n{'!'*30}")
             env.trigger_capacity_avalanche()
             env.trigger_traffic_flood()
-            print("!"*30 + "\n")
+        elif episode == 800 or episode == 1600:
+            print(f"\n{'='*30}\nINFO: Environment Recovered at Ep {episode}!\n{'='*30}")
+            env.recover_from_avalanche()
+            env.recover_from_flood()
             
         for t in range(steps_per_episode):
             # 选择动作
@@ -62,6 +66,8 @@ def train():
             # 统计这一步中真正执行的 legal_actions 分布
             for a in info['legal_actions']:
                 action_counts[a] += 1
+            for a in info['raw_actions']:
+                raw_action_counts[a] += 1
             
             # 核心修正：如果到了最后一步，强制视为 terminal，用于正确计算回报
             is_terminal = (t == steps_per_episode - 1) or done
@@ -90,6 +96,7 @@ def train():
         total_actions_in_ep = sum(action_counts.values())
         for a in range(4):
             history_action_ratios[a].append(action_counts[a] / total_actions_in_ep)
+            history_raw_action_ratios[a].append(raw_action_counts[a] / total_actions_in_ep)
 
     # === 训练结束，开始画图 ===
     os.makedirs('image', exist_ok=True)
@@ -118,8 +125,9 @@ def train():
     
     ax1.tick_params(axis='y', labelcolor=color)
     
-    # 灾难线
-    ax1.axvline(x=1000, color='r', linestyle='--', label='OOD Disaster (Ep 1000)')
+    # 灾难区阴影
+    ax1.axvspan(500, 800, color='red', alpha=0.1, label='OOD Disaster')
+    ax1.axvspan(1300, 1600, color='red', alpha=0.1)
     
     # 实例化一个共享 x 轴的第二个 y 轴用于 MEC Load
     ax2 = ax1.twinx()  
@@ -162,8 +170,9 @@ def train():
     ax_act.set_ylabel('Action Probability (Smoothed)')
     ax_act.set_title('Action Distribution Over Training (OOD Disaster Test)')
     
-    # 灾难线
-    ax_act.axvline(x=1000, color='black', linestyle='--', linewidth=2, label='OOD Disaster (Ep 1000)')
+    # 灾难区阴影
+    ax_act.axvspan(500, 800, color='red', alpha=0.1, label='OOD Disaster')
+    ax_act.axvspan(1300, 1600, color='red', alpha=0.1)
     ax_act.legend(loc='lower left')
     
     fig2.tight_layout()
@@ -171,11 +180,34 @@ def train():
     plt.savefig(save_path2, dpi=300)
     print(f"[OK] Action plot saved to {save_path2}")
     
+    # === 画图 3: Raw 动作分布图 (证明智能体真正意图) ===
+    fig3, ax_raw = plt.subplots(figsize=(10, 6))
+    r0 = smooth(history_raw_action_ratios[0], 0.95)
+    r1 = smooth(history_raw_action_ratios[1], 0.95)
+    r2 = smooth(history_raw_action_ratios[2], 0.95)
+    r3 = smooth(history_raw_action_ratios[3], 0.95)
+    
+    ax_raw.stackplot(range(1, max_episodes + 1), r0, r1, r2, r3, 
+                     labels=['Local (Action 0)', 'Local MEC (Action 1)', 'Remote MEC (Action 2)', 'Cloud (Action 3)'],
+                     colors=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'], alpha=0.8)
+    ax_raw.set_xlabel('Episodes')
+    ax_raw.set_ylabel('Raw Action Probability (Smoothed)')
+    ax_raw.set_title('Neural Network RAW Intent (Proof of Intelligence)')
+    # 灾难区阴影
+    ax_raw.axvspan(500, 800, color='red', alpha=0.1, label='OOD Disaster')
+    ax_raw.axvspan(1300, 1600, color='red', alpha=0.1)
+    ax_raw.legend(loc='lower left')
+    fig3.tight_layout()
+    save_path3 = os.path.abspath('image/raw_action_distribution.png')
+    plt.savefig(save_path3, dpi=300)
+    print(f"[OK] Raw Action plot saved to {save_path3}")
+    
     # 为了让聊天机器人能内嵌展示，把图片复制到 artifact 目录
     import shutil
-    artifact_dir = r"C:\Users\zrd\.gemini\antigravity\brain\798a053b-8f49-4bd5-b613-d2857bc4dfa6"
+    artifact_dir = r"C:\Users\zrd\.gemini\antigravity\brain\16d936b8-eb04-4bd2-bfb0-d092f15d7b64"
     shutil.copy(save_path, os.path.join(artifact_dir, "training_curve.png"))
     shutil.copy(save_path2, os.path.join(artifact_dir, "action_distribution.png"))
+    shutil.copy(save_path3, os.path.join(artifact_dir, "raw_action_distribution.png"))
 
 if __name__ == "__main__":
     train()

@@ -50,7 +50,7 @@ class ResidualPPOAgent:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
-        self.residual_scale = 5.0 # <--- 【核心修改】：右脑被锁后，赋予 5.0 的反杀权重
+        self.residual_scale = 15.0 # <--- 【核心修改】：右脑被锁后，赋予 15.0 的反杀权重
         
         # 强制使用 CPU (规避 RTX 5070 的 sm_120 兼容性报错)
         self.device = torch.device("cpu")
@@ -83,6 +83,10 @@ class ResidualPPOAgent:
             
             # <--- 【核心修改】：限制老专家固执度
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
+            
+            # OOD 抑制器
+            ood_mask = (state[:, 2] > 5.0).float().unsqueeze(1)
+            logits_prior = logits_prior * (1.0 - ood_mask)
             
             # 2. 右脑修正 (完整6维特征)
             delta_logits = self.residual_net.actor(state)
@@ -149,6 +153,10 @@ class ResidualPPOAgent:
             
             # <--- 【核心修改】：训练时同样限制老专家
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
+            
+            # OOD 抑制器
+            ood_mask_batch = (states[:, :, 2] > 5.0).float().unsqueeze(-1)
+            logits_prior = logits_prior * (1.0 - ood_mask_batch)
             
             # 2. 批量重塑送入右脑 Actor
             actor_x = states.view(-1, 6)

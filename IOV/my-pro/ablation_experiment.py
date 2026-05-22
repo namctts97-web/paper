@@ -42,9 +42,12 @@ def run_experiment(mode='residual', max_episodes=2000):
         episode_reward = 0
         episode_brain_wave = np.zeros(4)
         
-        if episode == 1000:
+        if episode == 500 or episode == 1300:
             env.trigger_capacity_avalanche()
             env.trigger_traffic_flood()
+        elif episode == 800 or episode == 1600:
+            env.recover_from_avalanche()
+            env.recover_from_flood()
             
         for t in range(steps_per_episode):
             # 获取脑电波
@@ -67,7 +70,7 @@ def run_experiment(mode='residual', max_episodes=2000):
         avg_reward = episode_reward / steps_per_episode
         avg_brain_wave = episode_brain_wave / steps_per_episode
         
-        if episode % 100 == 0 or (990 <= episode <= 1010):
+        if episode % 100 == 0 or (490 <= episode <= 510) or (790 <= episode <= 810):
             print(f"[{mode.upper()}] Ep {episode} \t Avg Cost(Reward): {avg_reward:.4f}", flush=True)
             
         history_rewards.append(avg_reward)
@@ -114,8 +117,9 @@ def main():
         
     ax1.set_xlabel('Episodes')
     ax1.set_ylabel('Average Cost (Negative Reward)')
-    ax1.set_title('Ablation Study: Dual-Brain vs Single-Brain under OOD Disaster')
-    ax1.axvline(x=1000, color='black', linestyle='--', linewidth=2, label='OOD Disaster Triggered (Ep 1000)')
+    ax1.set_title('Ablation Study: Dual-Brain vs Single-Brain (Non-Stationary OOD)')
+    ax1.axvspan(500, 800, color='red', alpha=0.1, label='OOD Disaster')
+    ax1.axvspan(1300, 1600, color='red', alpha=0.1)
     ax1.legend(loc='lower right')
     fig1.tight_layout()
     
@@ -126,21 +130,22 @@ def main():
     # 3. 画图二：脑电波爆发图 (Brain Waves) 专门针对 Residual 模式的 Action 3
     fig2, ax2 = plt.subplots(figsize=(12, 6))
     
-    # 取出 residual 模式的数据，提取 Action 3 的 delta_logits
+    # 取出 residual 模式的数据，提取所有 Action 的平均绝对干预强度 (Global Intervention)
     res_brain_waves = np.array(results_brain_waves['residual']) # shape: (2000, 4)
-    act3_waves = res_brain_waves[:, 3]
-    smoothed_act3 = smooth(act3_waves.tolist(), weight=0.8)
+    global_waves = np.mean(np.abs(res_brain_waves), axis=1)
+    smoothed_waves = smooth(global_waves.tolist(), weight=0.8)
     
-    ax2.plot(range(1, max_episodes + 1), act3_waves, color='purple', alpha=0.2)
-    ax2.plot(range(1, max_episodes + 1), smoothed_act3, color='purple', linewidth=2.5, label='Right Brain Correction Amplitude (Action 3: Cloud)')
+    ax2.plot(range(1, max_episodes + 1), global_waves, color='purple', alpha=0.2)
+    ax2.plot(range(1, max_episodes + 1), smoothed_waves, color='purple', linewidth=2.5, label='Right Brain Global Correction Amplitude')
     
     ax2.set_xlabel('Episodes')
-    ax2.set_ylabel('Magnitude of $\Delta$ Logits (Absolute Value)')
-    ax2.set_title('Brain Waves Analysis: Right Brain Intervention under Crisis')
-    ax2.axvline(x=1000, color='black', linestyle='--', linewidth=2, label='OOD Disaster Triggered (Ep 1000)')
+    ax2.set_ylabel('Mean Magnitude of $|\Delta$ Logits|')
+    ax2.set_title('Brain Waves Analysis: Right Brain Global Intervention Intensity')
+    ax2.axvspan(500, 800, color='red', alpha=0.1, label='OOD Disaster')
+    ax2.axvspan(1300, 1600, color='red', alpha=0.1)
     
     # 添加一个标注指出突刺
-    ax2.annotate('Sudden Spike (Forced Correction)', xy=(1000, max(smoothed_act3)), xytext=(1100, max(smoothed_act3)*0.8),
+    ax2.annotate('Sudden Spike (Forced Correction)', xy=(500, max(smoothed_waves)), xytext=(600, max(smoothed_waves)*0.8),
                  arrowprops=dict(facecolor='black', shrink=0.05))
                  
     ax2.legend(loc='upper right')
@@ -151,7 +156,7 @@ def main():
     print(f"[OK] Brain waves plot saved to {path_waves}")
     
     # 复制到 artifact
-    artifact_dir = r"C:\Users\zrd\.gemini\antigravity\brain\798a053b-8f49-4bd5-b613-d2857bc4dfa6"
+    artifact_dir = r"C:\Users\zrd\.gemini\antigravity\brain\16d936b8-eb04-4bd2-bfb0-d092f15d7b64"
     shutil.copy(path_ablation, os.path.join(artifact_dir, "ablation_curve.png"))
     shutil.copy(path_waves, os.path.join(artifact_dir, "brain_waves.png"))
 
