@@ -92,7 +92,8 @@ class ResidualIoVEnv(gym.Env):
     def _apply_disaster_state(self):
         """确保 reset 之后，灾难状态依然生效 (导师指令)"""
         if self.is_avalanche_triggered:
-            self.f_mec = 10 * (10**9) # 算力雪崩: 10GHz
+            self.f_mec = 2 * (10**9) # 真实算力雪崩: 从 28GHz 跌至 2GHz
+            self.shared_r_ec = 1e6   # 伴随核心网回传拥塞 (云端逃生通道受限)
             for es in self.edge_servers:
                 es.cpu = self.f_mec
                 
@@ -186,6 +187,8 @@ class ResidualIoVEnv(gym.Env):
         total_cost = 0
         actual_load_cycles = 0
         total_latency = 0
+        total_energy = 0
+        success_count = 0
         
         # ==========================================
         # 核心手术 1：引入回传带宽拥塞共享
@@ -247,6 +250,15 @@ class ResidualIoVEnv(gym.Env):
                 
             total_cost += v.lambda_i * T_i + v.mu_i * E_i
             total_latency += T_i
+            total_energy += E_i
+            
+            # Success Rate defined as Latency < 0.1s (100ms) for URLLC or strictly meeting T_max
+            if T_i <= self.T_max:
+                success_count += 1
+            else:
+                # 导师修改：添加极严苛的时延违规惩罚 (URLLC 核心)
+                # 迟到的包等于没用的包，超时的每一秒都要付出血的代价！
+                total_cost += 15.0 * (T_i - self.T_max)
             
         # 5. Reward
         reward = - (total_cost / len(self.vehicles)) - penalty
@@ -270,6 +282,8 @@ class ResidualIoVEnv(gym.Env):
             "legal_actions": legal_actions.tolist(), # 输出对比
             "avg_cost": total_cost / len(self.vehicles),
             "avg_latency": total_latency / len(self.vehicles),
+            "avg_energy": total_energy / len(self.vehicles),
+            "success_rate": success_count / len(self.vehicles),
             "mec_load": actual_load_cycles / (self.f_mec * self.T_max)
         }
         
@@ -323,6 +337,7 @@ class ResidualIoVEnv(gym.Env):
         """恢复算力雪崩"""
         self.is_avalanche_triggered = False
         self.f_mec = self.params['f_mec']
+        self.shared_r_ec = 10 * (10**6) # 恢复回传
         for es in self.edge_servers:
             es.cpu = self.f_mec
         print("\n[EVENT] RECOVERY: Capacity Avalanche Resolved! MEC Capacity -> 28GHz")

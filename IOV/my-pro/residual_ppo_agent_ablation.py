@@ -69,6 +69,9 @@ class ResidualPPOAgent:
         self.optimizer = optim.Adam(self.residual_net.parameters(), lr=lr)
         self.MseLoss = nn.MSELoss()
         
+        # 情景记忆池 (用于 ER-CL 抵抗灾难性遗忘)
+        self.ood_memory = []
+        
         self.buffer = []
 
     def select_action(self, state):
@@ -85,7 +88,7 @@ class ResidualPPOAgent:
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
             # OOD 抑制器
-            ood_mask = (state[:, 2] > 5.0).float().unsqueeze(1)
+            ood_mask = ((state[:, 2] > 5.0) | (state[:, 4] > 1.0)).float().unsqueeze(1)
             logits_prior = logits_prior * (1.0 - ood_mask)
             
             # 2. 右脑修正 (完整6维特征)
@@ -138,6 +141,33 @@ class ResidualPPOAgent:
             returns.insert(0, discounted_reward)
             
         returns = torch.FloatTensor(returns).to(self.device)
+        
+        # === ER-CL: 提取与存储高价值 OOD 记忆 ===
+        import random
+        for i in range(len(states)):
+            if states[i, 0, 2] > 5.0 or states[i, 0, 4] > 1.0:  # 检测到 OOD 状态
+                self.ood_memory.append((states[i].cpu(), actions[i].cpu(), old_logprobs[i].cpu(), returns[i].cpu()))
+        # 维护记忆池容量上限
+        if len(self.ood_memory) > 2000:
+            self.ood_memory = self.ood_memory[-2000:]
+            
+        # === ER-CL: 时空穿梭混合采样 ===
+        # 如果当前处于“和平年代”（当前 Batch 缺乏 OOD），且记忆库充足，注入历史灾难记忆
+        current_ood_count = sum([1 for i in range(len(states)) if states[i, 0, 2] > 5.0 or states[i, 0, 4] > 1.0])
+        if current_ood_count < len(states) * 0.1 and len(self.ood_memory) > 100:
+            sample_size = int(len(states) * 0.2)  # 混入 20% 的灾难样本
+            sampled = random.sample(self.ood_memory, sample_size)
+            
+            s_states = torch.stack([s[0] for s in sampled]).to(self.device)
+            s_actions = torch.stack([s[1] for s in sampled]).to(self.device)
+            s_old_logprobs = torch.stack([s[2] for s in sampled]).to(self.device)
+            s_returns = torch.stack([s[3] for s in sampled]).to(self.device)
+            
+            states = torch.cat([states, s_states], dim=0)
+            actions = torch.cat([actions, s_actions], dim=0)
+            old_logprobs = torch.cat([old_logprobs, s_old_logprobs], dim=0)
+            returns = torch.cat([returns, s_returns], dim=0)
+            
         # ！！！【核心修复 1】：彻底删掉对 returns 的归一化代码！！！
         
         # PPO 优化循环
@@ -154,8 +184,8 @@ class ResidualPPOAgent:
             # <--- 【核心修改】：训练时同样限制老专家
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
-            # OOD 抑制器
-            ood_mask_batch = (states[:, :, 2] > 5.0).float().unsqueeze(-1)
+            # 同步在训练时应用 OOD 抑制器
+            ood_mask_batch = ((states[:, :, 2] > 5.0) | (states[:, :, 4] > 1.0)).float().unsqueeze(-1) # (batch, N, 1)
             logits_prior = logits_prior * (1.0 - ood_mask_batch)
             
             # 2. 批量重塑送入右脑 Actor

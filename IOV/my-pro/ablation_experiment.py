@@ -42,12 +42,16 @@ def run_experiment(mode='residual', max_episodes=2000):
         episode_reward = 0
         episode_brain_wave = np.zeros(4)
         
-        if episode == 500 or episode == 1300:
-            env.trigger_capacity_avalanche()
-            env.trigger_traffic_flood()
-        elif episode == 800 or episode == 1600:
-            env.recover_from_avalanche()
-            env.recover_from_flood()
+        if episode == 400: env.trigger_capacity_avalanche()
+        if episode == 600: env.recover_from_avalanche()
+        if episode == 800: env.trigger_traffic_flood()
+        if episode == 1000: env.recover_from_flood()
+        
+        # 记忆重现测试点！
+        if episode == 1200: env.trigger_capacity_avalanche()
+        if episode == 1400: env.recover_from_avalanche()
+        if episode == 1600: env.trigger_traffic_flood()
+        if episode == 1800: env.recover_from_flood()
             
         for t in range(steps_per_episode):
             # 获取脑电波
@@ -70,7 +74,7 @@ def run_experiment(mode='residual', max_episodes=2000):
         avg_reward = episode_reward / steps_per_episode
         avg_brain_wave = episode_brain_wave / steps_per_episode
         
-        if episode % 100 == 0 or (490 <= episode <= 510) or (790 <= episode <= 810):
+        if episode % 100 == 0 or (390 <= episode <= 410) or (790 <= episode <= 810):
             print(f"[{mode.upper()}] Ep {episode} \t Avg Cost(Reward): {avg_reward:.4f}", flush=True)
             
         history_rewards.append(avg_reward)
@@ -118,9 +122,14 @@ def main():
     ax1.set_xlabel('Episodes')
     ax1.set_ylabel('Average Cost (Negative Reward)')
     ax1.set_title('Ablation Study: Dual-Brain vs Single-Brain (Non-Stationary OOD)')
-    ax1.axvspan(500, 800, color='red', alpha=0.1, label='OOD Disaster')
-    ax1.axvspan(1300, 1600, color='red', alpha=0.1)
-    ax1.legend(loc='lower right')
+    # 标注灾难区间 (4个区间)
+    ax1.axvspan(400, 600, color='red', alpha=0.1, label='Avalanche 1')
+    ax1.axvspan(800, 1000, color='orange', alpha=0.1, label='Flood 1')
+    ax1.axvspan(1200, 1400, color='purple', alpha=0.1, label='Avalanche 2 (Memory Test)')
+    ax1.axvspan(1600, 1800, color='brown', alpha=0.1, label='Flood 2 (Memory Test)')
+    
+    ax1.legend()
+    ax1.grid(True, linestyle='--', alpha=0.7)
     fig1.tight_layout()
     
     path_ablation = os.path.abspath('image/ablation_curve.png')
@@ -129,6 +138,12 @@ def main():
     
     # 3. 画图二：脑电波爆发图 (Brain Waves) 专门针对 Residual 模式的 Action 3
     fig2, ax2 = plt.subplots(figsize=(12, 6))
+    
+    # 标注灾难区间
+    ax2.axvspan(400, 600, color='red', alpha=0.1, label='OOD: Avalanche')
+    ax2.axvspan(800, 1000, color='orange', alpha=0.1, label='OOD: Flood')
+    ax2.axvspan(1200, 1400, color='purple', alpha=0.1, label='OOD: Avalanche 2')
+    ax2.axvspan(1600, 1800, color='brown', alpha=0.1, label='OOD: Flood 2')
     
     # 取出 residual 模式的数据，提取所有 Action 的平均绝对干预强度 (Global Intervention)
     res_brain_waves = np.array(results_brain_waves['residual']) # shape: (2000, 4)
@@ -141,8 +156,6 @@ def main():
     ax2.set_xlabel('Episodes')
     ax2.set_ylabel('Mean Magnitude of $|\Delta$ Logits|')
     ax2.set_title('Brain Waves Analysis: Right Brain Global Intervention Intensity')
-    ax2.axvspan(500, 800, color='red', alpha=0.1, label='OOD Disaster')
-    ax2.axvspan(1300, 1600, color='red', alpha=0.1)
     
     # 添加一个标注指出突刺
     ax2.annotate('Sudden Spike (Forced Correction)', xy=(500, max(smoothed_waves)), xytext=(600, max(smoothed_waves)*0.8),

@@ -83,9 +83,9 @@ class ResidualPPOAgent:
             prior_x[:, 2] = torch.clamp(prior_x[:, 2], max=5.0)
             logits_prior = self.prior_net(prior_x) # shape: (6, 4)
             
-            # 导师修正：动态 OOD 抑制器！如果发现 D_i 异常庞大(>5.0)，说明发生洪峰
+            # 导师修正：动态 OOD 抑制器！如果发现 D_i 异常庞大(>5.0) 说明发生洪峰，或者 mec_load 异常庞大(>1.0) 说明发生算力雪崩
             # 此时先验专家就是个庸医，直接将其输出权重归零，由右脑全面接管！
-            ood_mask = (state[:, 2] > 5.0).float().unsqueeze(1)
+            ood_mask = ((state[:, 2] > 5.0) | (state[:, 4] > 1.0)).float().unsqueeze(1)
             logits_prior = logits_prior * (1.0 - ood_mask)
             
             # 2. 右脑修正 (完整6维特征)
@@ -136,7 +136,7 @@ class ResidualPPOAgent:
         # === ER-CL: 提取与存储高价值 OOD 记忆 ===
         import random
         for i in range(len(states)):
-            if states[i, 0, 2] > 5.0:  # 检测到 OOD 状态
+            if states[i, 0, 2] > 5.0 or states[i, 0, 4] > 1.0:  # 检测到 洪峰 或 雪崩 状态
                 self.ood_memory.append((states[i].cpu(), actions[i].cpu(), old_logprobs[i].cpu(), returns[i].cpu()))
         # 维护记忆池容量上限
         if len(self.ood_memory) > 2000:
@@ -144,7 +144,7 @@ class ResidualPPOAgent:
             
         # === ER-CL: 时空穿梭混合采样 ===
         # 如果当前处于“和平年代”（当前 Batch 缺乏 OOD），且记忆库充足，注入历史灾难记忆
-        current_ood_count = sum([1 for i in range(len(states)) if states[i, 0, 2] > 5.0])
+        current_ood_count = sum([1 for i in range(len(states)) if states[i, 0, 2] > 5.0 or states[i, 0, 4] > 1.0])
         if current_ood_count < len(states) * 0.1 and len(self.ood_memory) > 100:
             sample_size = int(len(states) * 0.2)  # 混入 20% 的灾难样本
             sampled = random.sample(self.ood_memory, sample_size)
@@ -173,7 +173,7 @@ class ResidualPPOAgent:
             logits_prior = self.prior_net(prior_states).view(batch_size, N, 4)
             
             # 同步在训练时应用 OOD 抑制器
-            ood_mask_batch = (states[:, :, 2] > 5.0).float().unsqueeze(-1) # (batch, N, 1)
+            ood_mask_batch = ((states[:, :, 2] > 5.0) | (states[:, :, 4] > 1.0)).float().unsqueeze(-1) # (batch, N, 1)
             logits_prior = logits_prior * (1.0 - ood_mask_batch)
             
             # 2. 批量重塑送入右脑 Actor (切断串扰！)
