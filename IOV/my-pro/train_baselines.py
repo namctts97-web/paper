@@ -53,12 +53,12 @@ def main():
     action_dim = len(env.vehicles) * 4
     
     # 1. Train PPO Baseline (Normal PPO, no expert, no CL)
-    ppo_agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=3e-4, ablation_mode='ppo')
-    pretrain_algorithm('ppo', ppo_agent, env, max_episodes=2000, save_path='model/ppo_converged.pth')
+    # ppo_agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=3e-4, ablation_mode='ppo')
+    # pretrain_algorithm('ppo', ppo_agent, env, max_episodes=2000, save_path='model/ppo_converged.pth')
     
     # 2. Train GCN Baseline
-    gcn_agent = GCN_PPO_Agent(lr=3e-4)
-    pretrain_algorithm('gcn', gcn_agent, env, max_episodes=2000, save_path='model/gcn_converged.pth')
+    # gcn_agent = GCN_PPO_Agent(lr=3e-4)
+    # pretrain_algorithm('gcn', gcn_agent, env, max_episodes=2000, save_path='model/gcn_converged.pth')
     
     # 3. Train Ours (Dual-Brain)
     ours_agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=3e-4, ablation_mode='ours')

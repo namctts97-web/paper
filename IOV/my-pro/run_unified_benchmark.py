@@ -8,6 +8,48 @@ from my_iov_env import ResidualIoVEnv
 from residual_ppo_agent import ResidualPPOAgent
 from baseline_gcn_ppo import GCN_PPO_Agent
 from baseline_heuristic import Heuristic_Agent
+import torch.nn as nn
+from torch.distributions import Categorical
+
+class Legacy_ActorCritic(nn.Module):
+    def __init__(self, feature_dim=7, action_dim=4):
+        super(Legacy_ActorCritic, self).__init__()
+        self.actor = nn.Sequential(
+            nn.Linear(feature_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim)
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(42, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+    def forward_actor(self, state):
+        return self.actor(state)
+
+class LegacyPPOAgent:
+    def __init__(self, state_dim=42, action_dim=24):
+        self.device = torch.device('cpu')
+        self.policy = Legacy_ActorCritic(feature_dim=7, action_dim=4).to(self.device)
+    def load_model(self, path):
+        self.policy.load_state_dict(torch.load(path, map_location='cpu'))
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(self.device)
+        N = state.shape[0]
+        with torch.no_grad():
+            x = state.view(-1, 7)
+            logits = self.policy.actor(x).view(N, 4)
+            val = self.policy.critic(state.view(-1))
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            action_logprob = dist.log_prob(action).sum()
+        return action.cpu().numpy(), action_logprob.item(), val.item(), 0.0
+    def store_transition(self, transition):
+        pass
+    def update(self):
+        pass
 
 def set_seed(seed=42):
     np.random.seed(seed)
@@ -98,8 +140,7 @@ def run_evaluation(algo_name, max_episodes=500):
         if algo_name == 'ours':
             hist_brain_waves.append(np.mean(ep_brain_wave))
             
-        if episode % 50 == 0:
-            print(f"[{algo_name.upper()}] Ep {episode} | Latency: {avg_latency*1000:.1f}ms | Energy: {avg_energy:.2f}J | Cost: {avg_cost:.2f}")
+        print(f"[{algo_name.upper()}] Ep {episode} | Latency: {avg_latency*1000:.1f}ms | Energy: {avg_energy:.2f}J | Cost: {avg_cost:.2f}")
 
     return hist_latency, hist_energy, hist_success, hist_cost, hist_brain_waves
 
@@ -117,7 +158,7 @@ def main():
     os.makedirs('image', exist_ok=True)
     
     # 运行所有算法收集数据
-    algs = ['worst_fit', 'gcn', 'ppo', 'prior', 'ours']
+    algs = ['gcn', 'ppo', 'prior', 'ours']
     results = {}
     for alg in algs:
         results[alg] = run_evaluation(alg)
@@ -136,7 +177,7 @@ def main():
     labels_pb = {'worst_fit': 'Heuristic (Worst-Fit)', 'ppo': 'Standard DRL (PPO)', 'gcn': 'Topology-Aware (GCN-DRL)', 'ours': 'Dual-Brain ER-CL (Ours)'}
     
     for metric_name, idx, ax in metrics:
-        for alg in ['worst_fit', 'ppo', 'gcn', 'ours']:
+        for alg in ['ppo', 'gcn', 'ours']:
             smoothed_data = smooth(results[alg][idx], weight=0.8)
             if idx == 0:
                 ax.set_yscale('log')

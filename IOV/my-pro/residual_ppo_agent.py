@@ -6,6 +6,14 @@ import numpy as np
 import os
 import random
 
+class StateAutoencoder(nn.Module):
+    def __init__(self, feature_dim):
+        super(StateAutoencoder, self).__init__()
+        self.encoder = nn.Sequential(nn.Linear(feature_dim, 4), nn.ReLU())
+        self.decoder = nn.Sequential(nn.Linear(4, feature_dim))
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
 class Prior_DNN(nn.Module):
     """先验网络：系统的“本能反应”，权重冻结"""
     def __init__(self, state_dim, action_dim):
@@ -39,11 +47,8 @@ class Residual_ActorCritic(nn.Module):
         nn.init.orthogonal_(self.action_head[-2].weight, gain=0.01)
         nn.init.constant_(self.action_head[-2].bias, 0.0)
         
-        # 3. Gate Head (Dynamic activation confidence)
-        self.gate_head = nn.Sequential(
-            nn.Linear(128, action_dim),
-            nn.Sigmoid()
-        )
+        # 3. OOD Detector (Zero-Shot Gate)
+        self.autoencoder = StateAutoencoder(feature_dim)
         
         # Centralized Critic
         self.critic = nn.Sequential(
@@ -57,9 +62,12 @@ class Residual_ActorCritic(nn.Module):
     def forward_actor(self, state):
         feat = self.feature(state)
         action_comp = self.action_head(feat)
-        gate = self.gate_head(feat)
-        # 核心数学机制：用软门控动态缩放策略，允许门控学习在和平期闭合，而动作头被 EWC 冻结
-        return gate * action_comp
+        
+        reconstructed = self.autoencoder(state)
+        recon_error = torch.mean((state - reconstructed) ** 2, dim=-1, keepdim=True)
+        
+        gate = torch.sigmoid(50.0 * (recon_error.detach() - 0.05))
+        return gate * action_comp, gate, recon_error
 
 class ResidualPPOAgent:
     def __init__(self, state_dim=42, action_dim=24, lr=1e-4, gamma=0.99, K_epochs=4, eps_clip=0.2, ablation_mode='ours'):
@@ -95,7 +103,7 @@ class ResidualPPOAgent:
         self.ewc_anchor = {}
         self.ewc_fisher = {}
         for n, p in self.residual_net.named_parameters():
-            if 'gate_head' not in n and 'critic' not in n:
+            if 'autoencoder' not in n and 'critic' not in n:
                 self.ewc_anchor[n] = p.detach().clone()
                 self.ewc_fisher[n] = torch.zeros_like(p)
         
@@ -113,7 +121,8 @@ class ResidualPPOAgent:
                 logits_prior = self.prior_net(prior_x.view(-1, 4)).view(1, N, 4)
                 logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0)
                 
-            delta_logits = self.residual_net.forward_actor(s_state.view(-1, 7)).view(1, N, 4)
+            delta_logits, _, _ = self.residual_net.forward_actor(s_state.view(-1, 7))
+            delta_logits = delta_logits.view(1, N, 4)
             logits_final = logits_prior + self.residual_scale * delta_logits
             
             dist = Categorical(logits=logits_final)
@@ -123,7 +132,7 @@ class ResidualPPOAgent:
             logprob.backward()
             
             for n, p in self.residual_net.named_parameters():
-                if 'gate_head' not in n and 'critic' not in n:
+                if 'autoencoder' not in n and 'critic' not in n:
                     if p.grad is not None:
                         self.ewc_fisher[n] += (p.grad.detach() ** 2) / len(sampled)
                     
@@ -132,7 +141,7 @@ class ResidualPPOAgent:
 
     def load_expert(self, path):
         if os.path.exists(path):
-            self.prior_net.load_state_dict(torch.load(path, map_location=self.device))
+            self.prior_net.load_state_dict(torch.load(path, map_location='cpu'))
             print(f"=> Loaded Expert Prior from {path}", flush=True)
 
     def save_model(self, path):
@@ -140,7 +149,7 @@ class ResidualPPOAgent:
 
     def load_model(self, path):
         if os.path.exists(path):
-            self.residual_net.load_state_dict(torch.load(path, map_location=self.device))
+            self.residual_net.load_state_dict(torch.load(path, map_location='cpu'), strict=False)
             print(f"=> Loaded Agent Model from {path}", flush=True)
 
     def select_action(self, state):
@@ -155,17 +164,17 @@ class ResidualPPOAgent:
             # 【移除】暴力的 ood_mask 如果机制，全权交由残差网络调节
             
             # 2. 右脑 (替换为自门控 Actor)
-            delta_logits = self.residual_net.forward_actor(state)
+            delta_logits, gate, _ = self.residual_net.forward_actor(state)
             
             if self.ablation_mode == 'prior':
                 logits_final = logits_prior.clone()
-                brain_wave = torch.abs(delta_logits).mean(dim=0).cpu().numpy()
+                brain_wave = gate.mean().item()
             elif self.ablation_mode == 'ppo':
                 logits_final = self.residual_scale * delta_logits.clone() 
-                brain_wave = torch.abs(delta_logits).mean(dim=0).cpu().numpy()
+                brain_wave = gate.mean().item()
             else: # ours
                 logits_final = logits_prior + self.residual_scale * delta_logits
-                brain_wave = torch.abs(self.residual_scale * delta_logits).mean(dim=0).cpu().numpy()
+                brain_wave = gate.mean().item()
             
             value = self.residual_net.critic(state.view(-1))
             dist = Categorical(logits=logits_final)
@@ -222,7 +231,8 @@ class ResidualPPOAgent:
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
             actor_x = states.view(-1, 7)
-            delta_logits = self.residual_net.forward_actor(actor_x).view(batch_size, N, 4)
+            delta_logits, _, recon_error = self.residual_net.forward_actor(actor_x)
+            delta_logits = delta_logits.view(batch_size, N, 4)
             
             if self.ablation_mode == 'prior':
                 logits_final = logits_prior.clone()
@@ -276,7 +286,8 @@ class ResidualPPOAgent:
                     s_logits_prior = torch.clamp(s_logits_prior, min=-5.0, max=5.0)
                 
                 s_actor_x = s_states.view(-1, 7)
-                s_delta_logits = self.residual_net.forward_actor(s_actor_x).view(s_batch, N, 4)
+                s_delta_logits, _, _ = self.residual_net.forward_actor(s_actor_x)
+                s_delta_logits = s_delta_logits.view(s_batch, N, 4)
                 s_logits_final = s_logits_prior + self.residual_scale * s_delta_logits
                 
                 s_dist = Categorical(logits=s_logits_final)
@@ -299,7 +310,14 @@ class ResidualPPOAgent:
                 # 放松 EWC 系数，允许网络在灾难时做出策略大漂移，而不是被锁死在和平时期的动作分布
                 loss_ewc = 100.0 * loss_ewc
                 
-            loss_total = loss_ppo.mean() + loss_cl + loss_ewc
+            # 仅在正常数据上训练 Autoencoder
+            normal_mask = (initial_adv <= threshold).unsqueeze(-1).expand(-1, N).reshape(-1, 1)
+            if normal_mask.sum() > 0:
+                loss_ae = recon_error[normal_mask].mean() * 10.0
+            else:
+                loss_ae = torch.tensor(0.0).to(self.device)
+                
+            loss_total = loss_ppo.mean() + loss_cl + loss_ewc + loss_ae
             
             self.optimizer.zero_grad()
             loss_total.backward()
