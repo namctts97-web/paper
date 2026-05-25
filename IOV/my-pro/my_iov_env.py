@@ -33,9 +33,8 @@ class ResidualIoVEnv(gym.Env):
         self.r_ec = 100 * 10**6      # 到云端的专线带宽 100Mbps
         
         self.T_max = 1.0               # 最大容忍时间窗 1s
-        self.eta = 0.5                 # 乒乓惩罚系数
-        self.timeout_penalty = 15.0    # 时延违规惩罚超参数
-        self.rejection_penalty = 10.0  # 准入拒绝惩罚超参数
+        self.eta = 0.05                # 乒乓惩罚系数 (缩小以适应 DIR 比例)
+        self.V_max = 1.5               # 李雅普诺夫漂移最大惩罚比例 (Lyapunov Maximum Penalty Ratio)
         
         # 初始化模拟器
         self.simulator = Simulator(
@@ -125,6 +124,14 @@ class ResidualIoVEnv(gym.Env):
             for es in self.edge_servers:
                 es.cpu = self.f_mec
                 
+        if getattr(self, 'is_flood_triggered', False):
+            for v in self.vehicles:
+                v.U_i *= 10.0
+                v.D_i *= 10.0
+                
+        if getattr(self, 'is_compute_flood_triggered', False):
+            for v in self.vehicles:
+                v.D_i *= 50.0
 
 
     def _algorithm_wrapper(self, parameters):
@@ -156,9 +163,10 @@ class ResidualIoVEnv(gym.Env):
         # 数值保护：防止信道增益过小导致速率为 0
         return max(1e-3, abs(vehicle.h_t))
 
-    def apply_kkt_projection(self, raw_actions):
+    def apply_kkt_projection(self, raw_actions, estimated_rates):
         """
         [终极学术修正] 基于带约束松弛背包问题的 KKT 闭式解 (Closed-form KKT Projection)
+        与物理信道 CSI 前向耦合
         """
         legal_actions = np.copy(raw_actions)
         mec_demand_cycles = 0
@@ -173,7 +181,7 @@ class ResidualIoVEnv(gym.Env):
             # [终极学术修正] 计算真实的拉格朗日梯度 (Lagrangian Gradient)
             def kkt_gradient(idx):
                 v = self.vehicles[idx]
-                est_rate = 10 * 10**6 # 保守估计传输率
+                est_rate = estimated_rates[idx] # 使用前向耦合的瞬时物理速率
                 T_loc = v.D_i / self.f_local
                 E_loc = self.k_energy * (self.f_local**2) * v.D_i
                 Cost_loc = v.lambda_i * T_loc + v.mu_i * E_loc
@@ -199,8 +207,19 @@ class ResidualIoVEnv(gym.Env):
         return legal_actions
 
     def step(self, raw_actions):
-        # 1. 第一步绝对是：获取合法的物理动作！
-        legal_actions = self.apply_kkt_projection(raw_actions)
+        # [终极学术修正] 物理层前向耦合：提前计算瞬时 CSI
+        estimated_rates = []
+        offloading_count = sum(1 for a in raw_actions if a > 0)
+        available_B = self.B / offloading_count if offloading_count > 0 else self.B
+        for i, v in enumerate(self.vehicles):
+            h_t = self.calculate_fading_rate(v)
+            d_m = max(1e-4, math.sqrt(v.coordinates[0]**2 + v.coordinates[1]**2))
+            path_loss = 127 + 30 * math.log10(d_m / 1000.0)
+            signal_power = self.p_i * h_t * (10**(-path_loss/10))
+            estimated_rates.append(available_B * math.log2(1 + signal_power / self.noise_power))
+
+        # 1. 经过物理信道耦合的 KKT 准入控制
+        legal_actions = self.apply_kkt_projection(raw_actions, estimated_rates)
         self.current_step_actions = legal_actions # 让 _algorithm_wrapper 去执行合法的
         
         # 2. 计算乒乓惩罚 (必须使用 legal_actions 和上一次的 legal_actions 比较)
@@ -246,21 +265,24 @@ class ResidualIoVEnv(gym.Env):
             for idx in idx_offsite:
                 f_assigned[idx] = self.f_offsite * (math.sqrt(self.vehicles[idx].D_i) / sum_sqrt_D)
             
+        reward_list = []
+        
         for i, v in enumerate(self.vehicles):
-            h_t = self.calculate_fading_rate(v)
-            # 大尺度路损: 127 + 30 * log10(d_km)
+            # 注意：此处 h_t 已经在前向耦合阶段提前计算过了，直接使用，严禁二次推进随机游走！
             d_m = max(1e-4, math.sqrt(v.coordinates[0]**2 + v.coordinates[1]**2))
             path_loss = 127 + 30 * math.log10(d_m / 1000.0)
+            signal_power = self.p_i * max(1e-3, abs(v.h_t)) * (10**(-path_loss/10))
             
-            signal_power = self.p_i * h_t * (10**(-path_loss/10))
-            
-            # 导师修复：仅选择卸载（1,2,3）的车辆才占用并平分无线带宽
-            offloading_count = sum(1 for a in legal_actions if a > 0)
-            available_B = self.B / offloading_count if offloading_count > 0 else self.B
-            rate = available_B * math.log2(1 + signal_power / self.noise_power)
+            # 使用真实的合法动作人数重算带宽共享
+            actual_offloading_count = sum(1 for a in legal_actions if a > 0)
+            actual_available_B = self.B / actual_offloading_count if actual_offloading_count > 0 else self.B
+            rate = actual_available_B * math.log2(1 + signal_power / self.noise_power)
             
             U = v.U_i
             D = v.D_i
+            
+            # 计算绝对物理下界代价（本地执行）
+            Cost_local = v.lambda_i * (D / self.f_local) + v.mu_i * (self.k_energy * (self.f_local**2) * D)
             
             if legal_actions[i] == 0:
                 T_i = D / self.f_local
@@ -282,9 +304,11 @@ class ResidualIoVEnv(gym.Env):
                 T_i = T_trans + T_exec
                 E_i = self.p_i * (U / rate)
                 
-            total_cost += v.lambda_i * T_i + v.mu_i * E_i
+            Cost_actual = v.lambda_i * T_i + v.mu_i * E_i
+            
             total_latency += T_i
             total_energy += E_i
+            total_cost += Cost_actual
             
             if v.lambda_i > 0.6:
                 urllc_latency += T_i
@@ -295,23 +319,27 @@ class ResidualIoVEnv(gym.Env):
                 embb_energy += E_i
                 embb_count += 1
             
-            # Success Rate defined as Latency < 0.1s (100ms) for URLLC or strictly meeting T_max
             if T_i <= self.T_max:
                 success_count += 1
             else:
-                # 导师修改：添加极严苛的时延违规惩罚 (URLLC 核心)
-                # 迟到的包等于没用的包，超时的每一秒都要付出血的代价！
-                total_cost += self.timeout_penalty * (T_i - self.T_max)
+                # [终极学术修正] Arcsinh 渐进有界漂移罚函数 (Float32 精度安全)
+                x = (T_i - self.T_max) / self.T_max
+                penalty_ratio = 1.0 + (self.V_max - 1.0) * np.arcsinh(2.0 * x)
+                Cost_actual = Cost_local * penalty_ratio
                 
-            # [终极学术修正] 准入控制被拒惩罚 (Rejection Penalty)
-            if raw_actions[i] == 1 and legal_actions[i] == 0:
-                # 这是强化学习与运筹学约束完美结合的核心：
-                # 环境在物理上制止了你的荒谬行为（保护了 MEC 负载不会飙到 2400%），
-                # 但环境在算法上狠狠地惩罚了你的愚蠢尝试（倒逼神经网络收敛）！
-                total_cost += self.rejection_penalty
+            if raw_actions[i] > 0 and legal_actions[i] == 0:
+                # 被拒惩罚严格遵循李雅普诺夫下界最大比例
+                Cost_actual = Cost_local * self.V_max
+                
+            # DIR (Dimensionless Improvement Ratio) 计算
+            r_i = 1.0 - (Cost_actual / Cost_local)
             
-        # 5. Reward
-        reward = - (total_cost / len(self.vehicles)) - penalty
+            # 张量截断 (保证理论界限)
+            r_i = np.clip(r_i, 1.0 - self.V_max, 1.0)
+            reward_list.append(r_i)
+            
+        # 5. Reward (平均 DIR - 乒乓惩罚)
+        reward = np.mean(reward_list) - penalty
         obs = []
         for v in self.vehicles:
             # 专属车辆级视角矩阵构建 (完美 MDP 马尔可夫状态)

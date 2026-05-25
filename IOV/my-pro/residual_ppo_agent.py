@@ -6,11 +6,50 @@ import numpy as np
 import os
 import random
 
+class RunningMeanStd(nn.Module):
+    """
+    [终极学术修正] Welford's Online Algorithm 用于特征维度无关的 Z-Score 白化
+    保证物理异构维度的严格正交与计算图隔离
+    """
+    def __init__(self, shape, epsilon=1e-8):
+        super(RunningMeanStd, self).__init__()
+        self.register_buffer('mean', torch.zeros(shape))
+        self.register_buffer('var', torch.ones(shape))
+        self.register_buffer('count', torch.tensor(1e-4))
+        self.epsilon = epsilon
+
+    @torch.no_grad()
+    def update(self, x):
+        if x.dim() > len(self.mean.shape) + 1:
+            x = x.reshape(-1, *self.mean.shape) if len(self.mean.shape) > 0 else x.reshape(-1)
+            
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
+        batch_count = x.shape[0]
+        
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        
+        self.mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + torch.square(delta) * self.count * batch_count / tot_count
+        self.var = M2 / tot_count
+        self.count = tot_count
+
+    def forward(self, x, update=True):
+        if update and self.training:
+            self.update(x)
+        # [工程防火墙] 强制 detach，绝对禁止统计过程污染策略梯度反向传播
+        current_mean = self.mean.detach()
+        current_var = self.var.detach()
+        return (x - current_mean) / torch.sqrt(current_var + self.epsilon)
+
 class StateAutoencoder(nn.Module):
     def __init__(self, feature_dim):
         super(StateAutoencoder, self).__init__()
-        # [学术修正] 引入 LayerNorm 强制进行状态白化，防止重构误差被绝对值大的维度支配
-        self.norm = nn.LayerNorm(feature_dim)
+        # [学术修正] 废除 NLP 领域的 LayerNorm，引入强化学习标准的 RunningMeanStd
+        self.norm = RunningMeanStd(shape=(feature_dim,))
         self.encoder = nn.Sequential(
             nn.Linear(feature_dim, 16),
             nn.ReLU(),
@@ -107,6 +146,9 @@ class ResidualPPOAgent:
         self.residual_net = Residual_ActorCritic(7, 4, gate_temperature, ood_threshold).to(self.device)
         self.optimizer = optim.Adam(self.residual_net.parameters(), lr=lr)
         self.MseLoss = nn.MSELoss()
+        
+        # [学术修正] 独立的回报归一化器，根治 Critic 价值饥饿
+        self.ret_rms = RunningMeanStd(shape=()).to(self.device)
         
         self.ood_memory = []
         self.buffer = []
@@ -218,9 +260,15 @@ class ResidualPPOAgent:
             
         returns = torch.FloatTensor(returns).to(self.device)
         
+        # [学术修正] 根治价值饥饿 (Value Starvation)
+        # 强制将压缩后的 Return 展宽至方差为 1.0 的尺度
+        self.ret_rms.update(returns)
+        normalized_returns = (returns - self.ret_rms.mean.detach()) / torch.sqrt(self.ret_rms.var.detach() + self.ret_rms.epsilon)
+        
         with torch.no_grad():
             initial_values = self.residual_net.critic(states.view(states.size(0), -1)).squeeze()
-            initial_adv = torch.abs(returns - initial_values)
+            # Initial_values 已经是展宽后尺度的预测，计算残差 Advantage
+            initial_adv = torch.abs(normalized_returns - initial_values)
             
         if len(initial_adv) > 0:
             threshold = torch.quantile(initial_adv, 0.8)
@@ -245,7 +293,8 @@ class ResidualPPOAgent:
             logprobs = dist.log_prob(actions).sum(dim=1)
             dist_entropy = dist.entropy().sum(dim=1)
             
-            advantages = returns - values.detach()
+            # 使用 Normalized Returns 计算 Advantage
+            advantages = normalized_returns - values.detach()
             if advantages.std() > 1e-6:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             
@@ -253,7 +302,8 @@ class ResidualPPOAgent:
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
             
-            loss_ppo = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values, returns) - 0.01 * dist_entropy 
+            # 使用 Normalized Returns 计算 Critic MSE Loss (彻底解除 Loss 过小不收敛的问题)
+            loss_ppo = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values, normalized_returns) - 0.01 * dist_entropy 
             
             loss_cl = torch.tensor(0.0).to(self.device)
             if self.ablation_mode == 'ours' and len(self.ood_memory) > 100:
@@ -263,8 +313,11 @@ class ResidualPPOAgent:
                 s_returns = torch.stack([s[2] for s in sampled]).to(self.device)
                 s_old_logprobs = torch.stack([s[3] for s in sampled]).to(self.device)
                 
+                # 对灾难记忆池的 Return 同样执行展宽
+                s_norm_returns = (s_returns - self.ret_rms.mean.detach()) / torch.sqrt(self.ret_rms.var.detach() + self.ret_rms.epsilon)
+                
                 s_values = self.residual_net.critic(s_states.view(s_states.size(0), -1)).squeeze()
-                s_adv = s_returns - s_values.detach()
+                s_adv = s_norm_returns - s_values.detach()
                 s_adv = (s_adv - s_adv.mean()) / (s_adv.std() + 1e-8)
                 
                 with torch.no_grad():
