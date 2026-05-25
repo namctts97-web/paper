@@ -68,11 +68,18 @@ class ResidualIoVEnv(gym.Env):
                 v.U_i = random.uniform(10, 50) * 1024 * 8            # 10KB - 50KB (bits)
                 v.D_i = random.uniform(100, 500) * (10**6)           # 0.1 - 0.5 Gcycles
             else:
-                # 70% eMBB 任务 (更敏感于能耗，大数据轻计算)
+                # 70% eMBB 任务，将其一分为二：AI计算型 vs 传统背景型
                 v.lambda_i = np.clip(np.random.normal(0.25, 0.1), 0.0, 0.5)
-                v.U_i = random.uniform(5000, 20000) * 1024 * 8       # 5MB - 20MB (bits)
-                # 导师修正：匹配现代真实车联网 AI 负载，20MB 数据对应的模型计算量应在 50~200 Gcycles
-                v.D_i = random.uniform(50, 200) * (10**9)          # 50 - 200 Gcycles
+                
+                if random.random() < 0.5:
+                    # 1. AI 计算型 eMBB (如 3D 点云检测)：归宿 -> 云端 / 边缘
+                    v.U_i = random.uniform(5000, 20000) * 1024 * 8       # 5MB - 20MB (bits)
+                    v.D_i = random.uniform(50, 200) * (10**9)            # 50 - 200 Gcycles (计算密集)
+                else:
+                    # 2. 传统数据型 eMBB (如 视频打包缓存)：归宿 -> 死守本地
+                    # 导师约束：引入重数据、轻计算任务
+                    v.U_i = random.uniform(20000, 50000) * 1024 * 8      # 20MB - 50MB (bits) 数据量极大
+                    v.D_i = random.uniform(1, 2) * (10**9)               # 1 - 2 Gcycles 计算量极小
                 
             v.mu_i = 1.0 - v.lambda_i
 
