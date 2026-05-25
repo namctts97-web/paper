@@ -34,6 +34,8 @@ class ResidualIoVEnv(gym.Env):
         
         self.T_max = 1.0               # 最大容忍时间窗 1s
         self.eta = 0.5                 # 乒乓惩罚系数
+        self.timeout_penalty = 15.0    # 时延违规惩罚超参数
+        self.rejection_penalty = 10.0  # 准入拒绝惩罚超参数
         
         # 初始化模拟器
         self.simulator = Simulator(
@@ -156,8 +158,7 @@ class ResidualIoVEnv(gym.Env):
 
     def apply_kkt_projection(self, raw_actions):
         """
-        [终极学术修正] 带惩罚的物理准入控制 (Admission Control)
-        基站并非无底洞，当总需求引发算力雪崩时，基站会主动启动准入控制，拒绝多余的任务。
+        [终极学术修正] 基于带约束松弛背包问题的 KKT 闭式解 (Closed-form KKT Projection)
         """
         legal_actions = np.copy(raw_actions)
         mec_demand_cycles = 0
@@ -169,9 +170,24 @@ class ResidualIoVEnv(gym.Env):
         max_mec_capacity = self.f_mec * self.T_max
         
         if mec_demand_cycles > max_mec_capacity:
-            # [终极学术修正] 真正的 KKT 影子价格投影：按照紧急程度 lambda_i 排序 (从小到大，优先踢掉最不紧急的)
+            # [终极学术修正] 计算真实的拉格朗日梯度 (Lagrangian Gradient)
+            def kkt_gradient(idx):
+                v = self.vehicles[idx]
+                est_rate = 10 * 10**6 # 保守估计传输率
+                T_loc = v.D_i / self.f_local
+                E_loc = self.k_energy * (self.f_local**2) * v.D_i
+                Cost_loc = v.lambda_i * T_loc + v.mu_i * E_loc
+                
+                T_mec = v.U_i / est_rate + v.D_i / self.f_mec
+                E_mec = self.p_i * (v.U_i / est_rate)
+                Cost_mec = v.lambda_i * T_mec + v.mu_i * E_mec
+                
+                # 边际收益 / 资源消耗
+                return (Cost_loc - Cost_mec) / v.D_i
+
             mec_vehicles = [i for i, a in enumerate(raw_actions) if a == 1]
-            mec_vehicles.sort(key=lambda x: self.vehicles[x].lambda_i)
+            # 按照拉格朗日梯度从小到大排序 (优先踢掉卸载性价比最低的)
+            mec_vehicles.sort(key=kkt_gradient)
             
             current_demand = mec_demand_cycles
             for i in mec_vehicles:
@@ -285,14 +301,14 @@ class ResidualIoVEnv(gym.Env):
             else:
                 # 导师修改：添加极严苛的时延违规惩罚 (URLLC 核心)
                 # 迟到的包等于没用的包，超时的每一秒都要付出血的代价！
-                total_cost += 15.0 * (T_i - self.T_max)
+                total_cost += self.timeout_penalty * (T_i - self.T_max)
                 
             # [终极学术修正] 准入控制被拒惩罚 (Rejection Penalty)
             if raw_actions[i] == 1 and legal_actions[i] == 0:
                 # 这是强化学习与运筹学约束完美结合的核心：
                 # 环境在物理上制止了你的荒谬行为（保护了 MEC 负载不会飙到 2400%），
                 # 但环境在算法上狠狠地惩罚了你的愚蠢尝试（倒逼神经网络收敛）！
-                total_cost += 10.0
+                total_cost += self.rejection_penalty
             
         # 5. Reward
         reward = - (total_cost / len(self.vehicles)) - penalty

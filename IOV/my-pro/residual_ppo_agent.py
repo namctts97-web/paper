@@ -9,10 +9,24 @@ import random
 class StateAutoencoder(nn.Module):
     def __init__(self, feature_dim):
         super(StateAutoencoder, self).__init__()
-        self.encoder = nn.Sequential(nn.Linear(feature_dim, 4), nn.ReLU())
-        self.decoder = nn.Sequential(nn.Linear(4, feature_dim))
+        # [学术修正] 引入 LayerNorm 强制进行状态白化，防止重构误差被绝对值大的维度支配
+        self.norm = nn.LayerNorm(feature_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 8)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(8, 16),
+            nn.ReLU(),
+            nn.Linear(16, feature_dim)
+        )
+
     def forward(self, x):
-        return self.decoder(self.encoder(x))
+        norm_x = self.norm(x)
+        encoded = self.encoder(norm_x)
+        decoded = self.decoder(encoded)
+        return decoded, norm_x
 
 class Prior_DNN(nn.Module):
     """先验网络：系统的“本能反应”，权重冻结"""
@@ -30,8 +44,11 @@ class Prior_DNN(nn.Module):
         return self.net(state)
 
 class Residual_ActorCritic(nn.Module):
-    def __init__(self, N_vehicles=6, feature_dim=7, action_dim=4): # 状态维度从6增加到7
+    def __init__(self, feature_dim, action_dim, gate_temperature=50.0, ood_threshold=0.05):
         super(Residual_ActorCritic, self).__init__()
+        self.gate_temperature = gate_temperature
+        self.ood_threshold = ood_threshold
+        
         # 1. Feature Extractor
         self.feature = nn.Sequential(
             nn.Linear(feature_dim, 128),
@@ -50,38 +67,44 @@ class Residual_ActorCritic(nn.Module):
         # 3. OOD Detector (Zero-Shot Gate)
         self.autoencoder = StateAutoencoder(feature_dim)
         
-        # Centralized Critic
+        # Centralized Critic (Critic 仍然需要全局视野，所以使用 flatten 的 N*feature_dim)
         self.critic = nn.Sequential(
-            nn.Linear(N_vehicles * feature_dim, 128),
+            nn.Linear(6 * feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 1)
         )
 
-    def forward_actor(self, state):
-        feat = self.feature(state)
-        action_comp = self.action_head(feat)
+    def forward_actor(self, state, logits_prior):
+        x = self.feature(state)
+        delta_logits = self.action_head(x)
+        delta_logits = delta_logits.view(logits_prior.size())
         
-        reconstructed = self.autoencoder(state)
-        recon_error = torch.mean((state - reconstructed) ** 2, dim=-1, keepdim=True)
+        action_comp = logits_prior + delta_logits
         
-        gate = torch.sigmoid(50.0 * (recon_error.detach() - 0.05))
+        # [学术修正] 无监督物理异常检测 (使用白化后的状态)
+        reconstructed, norm_state = self.autoencoder(state)
+        recon_error = torch.mean((norm_state - reconstructed) ** 2, dim=-1, keepdim=True)
+        
+        # [学术修正] 移除魔法数字，使用网格搜索超参数
+        gate = torch.sigmoid(self.gate_temperature * (recon_error.detach() - self.ood_threshold))
         return gate * action_comp, gate, recon_error
 
 class ResidualPPOAgent:
-    def __init__(self, state_dim=42, action_dim=24, lr=1e-4, gamma=0.99, K_epochs=4, eps_clip=0.2, ablation_mode='ours'):
+    def __init__(self, state_dim=42, action_dim=24, lr=1e-4, gamma=0.99, K_epochs=4, eps_clip=0.2, ablation_mode='ours', lambda_ewc=100.0, ood_threshold=0.05, gate_temperature=50.0):
         self.ablation_mode = ablation_mode
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.residual_scale = 15.0
+        self.lambda_ewc = lambda_ewc
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 提取前4维给左脑 (去除预警特征)
         self.prior_net = Prior_DNN(4, 4).to(self.device)
-        self.residual_net = Residual_ActorCritic(N_vehicles=6, feature_dim=7, action_dim=4).to(self.device)
+        self.residual_net = Residual_ActorCritic(7, 4, gate_temperature, ood_threshold).to(self.device)
         self.optimizer = optim.Adam(self.residual_net.parameters(), lr=lr)
         self.MseLoss = nn.MSELoss()
         
@@ -93,13 +116,15 @@ class ResidualPPOAgent:
         self.ewc_anchor = {}
 
     def update_ewc(self):
-        """[导师学术修正] 精确计算二阶梯度的近似（Fisher Information Matrix）并锚定核心参数"""
-        if len(self.ood_memory) < 50:
-            print("[EWC] OOD memory too small to compute Fisher Information.", flush=True)
+        """灾难发生时，计算 EWC 的 Fisher 矩阵保护 Prior 知识"""
+        if len(self.ood_memory) < 100:
             return
             
         print("\n[EWC] Computing Fisher Information Matrix to freeze disaster memory...", flush=True)
-        # [精细化手术] 仅仅保护 feature 和 action_head，让 gate_head 和 critic 绝对保持塑性！
+        # [学术修正] 扩大 Fisher 采样规模，降低 Empirical Fisher 的高维方差
+        sample_size = min(1000, len(self.ood_memory))
+        sampled = random.sample(self.ood_memory, sample_size)
+        
         self.ewc_anchor = {}
         self.ewc_fisher = {}
         for n, p in self.residual_net.named_parameters():
@@ -107,34 +132,29 @@ class ResidualPPOAgent:
                 self.ewc_anchor[n] = p.detach().clone()
                 self.ewc_fisher[n] = torch.zeros_like(p)
         
-        sampled = random.sample(self.ood_memory, min(200, len(self.ood_memory)))
-        
         for s in sampled:
             s_state = s[0].unsqueeze(0).to(self.device)
             s_action = s[1].unsqueeze(0).to(self.device)
-            N = s_state.shape[1]
             
             self.optimizer.zero_grad()
             
             prior_x = s_state[:, :, :4].clone()
             with torch.no_grad():
-                logits_prior = self.prior_net(prior_x.view(-1, 4)).view(1, N, 4)
+                logits_prior = self.prior_net(prior_x)
                 logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0)
                 
-            delta_logits, _, _ = self.residual_net.forward_actor(s_state.view(-1, 7))
-            delta_logits = delta_logits.view(1, N, 4)
+            delta_logits, _, _ = self.residual_net.forward_actor(s_state, logits_prior)
             logits_final = logits_prior + self.residual_scale * delta_logits
             
             dist = Categorical(logits=logits_final)
             logprob = dist.log_prob(s_action).sum()
             
-            # 真实 Empirical Fisher：对数似然概率梯度平方的期望
             logprob.backward()
             
             for n, p in self.residual_net.named_parameters():
                 if 'autoencoder' not in n and 'critic' not in n:
                     if p.grad is not None:
-                        self.ewc_fisher[n] += (p.grad.detach() ** 2) / len(sampled)
+                        self.ewc_fisher[n] += (p.grad.detach() ** 2) / sample_size
                     
         self.optimizer.zero_grad()
         print("[EWC] Fisher Information Matrix computed successfully.\n", flush=True)
@@ -153,35 +173,27 @@ class ResidualPPOAgent:
             print(f"=> Loaded Agent Model from {path}", flush=True)
 
     def select_action(self, state):
-        state = torch.FloatTensor(state).to(self.device)
-        N = state.shape[0]
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         with torch.no_grad():
-            # 1. 左脑
-            prior_x = state[:, :4].clone()
+            prior_x = state[:, :, :4].clone()
             logits_prior = self.prior_net(prior_x)
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
-            # 【移除】暴力的 ood_mask 如果机制，全权交由残差网络调节
-            
-            # 2. 右脑 (替换为自门控 Actor)
-            delta_logits, gate, _ = self.residual_net.forward_actor(state)
+            delta_logits, gate, _ = self.residual_net.forward_actor(state, logits_prior)
             
             if self.ablation_mode == 'prior':
                 logits_final = logits_prior.clone()
-                brain_wave = gate.mean().item()
             elif self.ablation_mode == 'ppo':
                 logits_final = self.residual_scale * delta_logits.clone() 
-                brain_wave = gate.mean().item()
-            else: # ours
+            else: 
                 logits_final = logits_prior + self.residual_scale * delta_logits
-                brain_wave = gate.mean().item()
             
-            value = self.residual_net.critic(state.view(-1))
+            value = self.residual_net.critic(state.view(state.size(0), -1))
             dist = Categorical(logits=logits_final)
             action = dist.sample()
             action_logprob = dist.log_prob(action).sum()
             
-        return action.cpu().numpy(), action_logprob.item(), value.item(), brain_wave
+        return action.squeeze(0).cpu().numpy(), action_logprob.item(), value.item(), gate.mean().item()
 
     def store_transition(self, transition):
         self.buffer.append(transition)
@@ -206,43 +218,28 @@ class ResidualPPOAgent:
             
         returns = torch.FloatTensor(returns).to(self.device)
         
-        # [导师学术修正] 提取 OOD 记忆：废除物理阈值硬编码，改为基于内在优势的数学动态筛选
         with torch.no_grad():
-            initial_values = self.residual_net.critic(states.view(states.shape[0], -1)).squeeze()
+            initial_values = self.residual_net.critic(states.view(states.size(0), -1)).squeeze()
             initial_adv = torch.abs(returns - initial_values)
             
         if len(initial_adv) > 0:
-            threshold = torch.quantile(initial_adv, 0.8) # 提取网络预测误差最大的 Top 20%
+            threshold = torch.quantile(initial_adv, 0.8)
             for i in range(len(states)):
                 if initial_adv[i] > threshold:
-                    # 必须保存 old_logprobs 用于后续的 Importance Sampling
                     self.ood_memory.append((states[i].cpu(), actions[i].cpu(), returns[i].cpu(), old_logprobs[i].cpu()))
                     
         if len(self.ood_memory) > 2000:
             self.ood_memory = self.ood_memory[-2000:]
             
-        # PPO 优化循环
         for _ in range(self.K_epochs):
-            batch_size = states.shape[0]
-            N = states.shape[1]
-            
-            prior_states = states[:, :, :4].contiguous().view(-1, 4).clone()
-            logits_prior = self.prior_net(prior_states).view(batch_size, N, 4)
+            prior_states = states[:, :, :4].clone()
+            logits_prior = self.prior_net(prior_states)
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
-            actor_x = states.view(-1, 7)
-            delta_logits, _, recon_error = self.residual_net.forward_actor(actor_x)
-            delta_logits = delta_logits.view(batch_size, N, 4)
+            delta_logits, _, recon_error = self.residual_net.forward_actor(states, logits_prior)
+            logits_final = logits_prior + self.residual_scale * delta_logits
             
-            if self.ablation_mode == 'prior':
-                logits_final = logits_prior.clone()
-            elif self.ablation_mode == 'ppo':
-                logits_final = self.residual_scale * delta_logits.clone()
-            else:
-                logits_final = logits_prior + self.residual_scale * delta_logits
-            
-            critic_x = states.view(batch_size, -1)
-            values = self.residual_net.critic(critic_x).squeeze()
+            values = self.residual_net.critic(states.view(states.size(0), -1)).squeeze()
             
             dist = Categorical(logits=logits_final)
             logprobs = dist.log_prob(actions).sum(dim=1)
@@ -256,12 +253,8 @@ class ResidualPPOAgent:
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
             
-            l2_penalty = (delta_logits ** 2).mean()
-            loss_ppo = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values.squeeze(), returns) - 0.01 * dist_entropy 
-            if self.ablation_mode == 'ours':
-                loss_ppo += 0.05 * l2_penalty
-                
-            # === 导师修正：优势加权辅助损失 (Advantage-Weighted CL Loss) 引入 IS 比率 ===
+            loss_ppo = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values, returns) - 0.01 * dist_entropy 
+            
             loss_cl = torch.tensor(0.0).to(self.device)
             if self.ablation_mode == 'ours' and len(self.ood_memory) > 100:
                 sampled = random.sample(self.ood_memory, int(len(states) * 0.2))
@@ -270,50 +263,35 @@ class ResidualPPOAgent:
                 s_returns = torch.stack([s[2] for s in sampled]).to(self.device)
                 s_old_logprobs = torch.stack([s[3] for s in sampled]).to(self.device)
                 
-                s_batch = s_states.shape[0]
-                s_critic_x = s_states.view(s_batch, -1)
-                s_values = self.residual_net.critic(s_critic_x).squeeze()
-                
-                # 计算优势，不使用单调 ReLU，保留双向梯度
+                s_values = self.residual_net.critic(s_states.view(s_states.size(0), -1)).squeeze()
                 s_adv = s_returns - s_values.detach()
-                if s_adv.std() > 1e-6:
-                    s_adv = (s_adv - s_adv.mean()) / (s_adv.std() + 1e-8)
+                s_adv = (s_adv - s_adv.mean()) / (s_adv.std() + 1e-8)
                 
-                # 提取动作的对数概率
-                s_prior_states = s_states[:, :, :4].contiguous().view(-1, 4).clone()
                 with torch.no_grad():
-                    s_logits_prior = self.prior_net(s_prior_states).view(s_batch, N, 4)
+                    s_logits_prior = self.prior_net(s_states[:, :, :4])
                     s_logits_prior = torch.clamp(s_logits_prior, min=-5.0, max=5.0)
                 
-                s_actor_x = s_states.view(-1, 7)
-                s_delta_logits, _, _ = self.residual_net.forward_actor(s_actor_x)
-                s_delta_logits = s_delta_logits.view(s_batch, N, 4)
+                s_delta_logits, _, _ = self.residual_net.forward_actor(s_states, s_logits_prior)
                 s_logits_final = s_logits_prior + self.residual_scale * s_delta_logits
                 
                 s_dist = Categorical(logits=s_logits_final)
                 s_logprobs = s_dist.log_prob(s_actions).sum(dim=1)
                 
-                # 计算重要性采样比率 (Importance Sampling Ratio)
                 ratio = torch.exp(s_logprobs - s_old_logprobs)
-                
-                # 严格使用带截断的 PPO 目标，防止 Off-Policy 数据造成梯度爆炸
-                surr1_cl = ratio * s_adv
-                surr2_cl = torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * s_adv
-                loss_cl = - torch.min(surr1_cl, surr2_cl).mean() * 0.1 # 辅助损失权重
+                loss_cl = - torch.min(ratio * s_adv, torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * s_adv).mean() * 0.1
             
-            # === 导师修正：注入 EWC 曲率惩罚 ===
             loss_ewc = torch.tensor(0.0).to(self.device)
             if self.ablation_mode == 'ours' and len(self.ewc_fisher) > 0:
                 for n, p in self.residual_net.named_parameters():
                     if n in self.ewc_fisher:
                         loss_ewc += (self.ewc_fisher[n] * (p - self.ewc_anchor[n]) ** 2).sum()
-                # 放松 EWC 系数，允许网络在灾难时做出策略大漂移，而不是被锁死在和平时期的动作分布
-                loss_ewc = 100.0 * loss_ewc
+                if loss_ewc > 0:
+                    loss_ewc = self.lambda_ewc * loss_ewc
                 
-            # 仅在正常数据上训练 Autoencoder
-            normal_mask = (initial_adv <= threshold).unsqueeze(-1).expand(-1, N).reshape(-1, 1)
+            normal_mask = (initial_adv <= threshold).unsqueeze(-1).expand(-1, 6).reshape(-1, 1)
+            recon_error_flat = recon_error.view(-1, 1)
             if normal_mask.sum() > 0:
-                loss_ae = recon_error[normal_mask].mean() * 10.0
+                loss_ae = recon_error_flat[normal_mask].mean() * 10.0
             else:
                 loss_ae = torch.tensor(0.0).to(self.device)
                 
