@@ -115,6 +115,10 @@ class Residual_ActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 1)
         )
+        
+        # [学术修正] 戴着镣铐跳舞的自适应温度参数
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.R_max = 5.0
 
     def forward_actor(self, state, logits_prior):
         x = self.feature(state)
@@ -133,8 +137,9 @@ class Residual_ActorCritic(nn.Module):
             gate = torch.ones_like(gate)
         
         # [代数坍缩修正] 绝对禁止在 forward_actor 内部再次叠加 logits_prior！
-        # 这里只允许输出纯净的门控残差修正量： G * NN_out
-        return gate * delta_logits, gate, recon_error
+        # 这里只允许输出纯净的门控残差修正量，并带有物理防爆边界 R_max
+        adaptive_scale = self.R_max * torch.sigmoid(self.alpha)
+        return adaptive_scale * gate * delta_logits, gate, recon_error
 
 class ResidualPPOAgent:
     def __init__(self, state_dim=42, action_dim=24, lr=1e-4, gamma=0.99, K_epochs=4, eps_clip=0.2, ablation_mode='ours', lambda_ewc=100.0, ood_threshold=0.05, gate_temperature=50.0):
@@ -145,7 +150,7 @@ class ResidualPPOAgent:
         self.residual_scale = 15.0
         self.lambda_ewc = lambda_ewc
         
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")
         
         # 提取前4维给左脑 (去除预警特征)
         self.prior_net = Prior_DNN(4, 4).to(self.device)
@@ -162,6 +167,16 @@ class ResidualPPOAgent:
         # EWC 记忆容器
         self.ewc_fisher = {}
         self.ewc_anchor = {}
+
+    def init_ewc_anchor(self):
+        """[学术修正] EWC 逻辑拨乱反正：锚定初始基线（即等价于 Prior DNN）"""
+        print("\n[EWC] Initializing Fisher Anchor to left-brain safe baseline...", flush=True)
+        self.ewc_anchor = {}
+        self.ewc_fisher = {}
+        for n, p in self.residual_net.named_parameters():
+            if 'autoencoder' not in n and 'critic' not in n:
+                self.ewc_anchor[n] = p.detach().clone()
+                self.ewc_fisher[n] = torch.ones_like(p) # 使用 L2 正则近似 Empirical Fisher 以确保稳定
 
     def update_ewc(self):
         """灾难发生时，计算 EWC 的 Fisher 矩阵保护 Prior 知识"""
@@ -209,7 +224,9 @@ class ResidualPPOAgent:
 
     def load_expert(self, path):
         if os.path.exists(path):
+            self.prior_net.eval()
             self.prior_net.load_state_dict(torch.load(path, map_location='cpu'))
+            self.init_ewc_anchor() # 加载完专家后立即初始化 EWC 锚点
             print(f"=> Loaded Expert Prior from {path}", flush=True)
 
     def save_model(self, path):
@@ -232,9 +249,10 @@ class ResidualPPOAgent:
             if self.ablation_mode == 'prior':
                 logits_final = logits_prior.clone()
             elif self.ablation_mode == 'ppo':
-                logits_final = self.residual_scale * delta_logits.clone() 
+                # PPO baseline also gets the adaptive scale from forward_actor
+                logits_final = delta_logits.clone() 
             else: 
-                logits_final = logits_prior + self.residual_scale * delta_logits
+                logits_final = logits_prior + delta_logits
             
             value = self.residual_net.critic(state.view(state.size(0), -1))
             dist = Categorical(logits=logits_final)
@@ -297,8 +315,10 @@ class ResidualPPOAgent:
             logits_prior = self.prior_net(prior_states)
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
-            delta_logits, _, recon_error = self.residual_net.forward_actor(states, logits_prior)
-            logits_final = logits_prior + self.residual_scale * delta_logits
+            delta_logits, gate, recon_error = self.residual_net.forward_actor(states, logits_prior)
+            
+            # forward_actor 已经包含了 self.alpha 和 gate
+            logits_final = logits_prior + delta_logits
             
             values = self.residual_net.critic(states.view(states.size(0), -1)).squeeze()
             
@@ -345,7 +365,7 @@ class ResidualPPOAgent:
                     s_logits_prior = torch.clamp(s_logits_prior, min=-5.0, max=5.0)
                 
                 s_delta_logits, _, _ = self.residual_net.forward_actor(s_states, s_logits_prior)
-                s_logits_final = s_logits_prior + self.residual_scale * s_delta_logits
+                s_logits_final = s_logits_prior + s_delta_logits
                 
                 s_dist = Categorical(logits=s_logits_final)
                 s_logprobs = s_dist.log_prob(s_actions).sum(dim=1)
@@ -354,12 +374,15 @@ class ResidualPPOAgent:
                 loss_cl = - torch.min(ratio * s_adv, torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * s_adv).mean() * 0.1
             
             loss_ewc = torch.tensor(0.0).to(self.device)
+            mean_gate = gate.mean().item()
             if self.ablation_mode == 'ours' and len(self.ewc_fisher) > 0:
                 for n, p in self.residual_net.named_parameters():
                     if n in self.ewc_fisher:
                         loss_ewc += (self.ewc_fisher[n] * (p - self.ewc_anchor[n]) ** 2).sum()
                 if loss_ewc > 0:
-                    loss_ewc = self.lambda_ewc * loss_ewc
+                    # [学术修正] 动态 EWC 阻尼：灾难越严重(Gate越大)，惩罚越小
+                    lambda_dynamic = self.lambda_ewc * (1.0 - mean_gate)
+                    loss_ewc = lambda_dynamic * loss_ewc
                 
             normal_mask = (initial_adv <= threshold).unsqueeze(-1).expand(-1, 6).reshape(-1, 1)
             recon_error_flat = recon_error.view(-1, 1)
@@ -367,6 +390,11 @@ class ResidualPPOAgent:
                 loss_ae = recon_error_flat[normal_mask].mean() * 10.0
             else:
                 loss_ae = torch.tensor(0.0).to(self.device)
+                
+            # TODO: Concept Drift Adaptation Handler
+            # if mean_gate > 0.8 and disaster_duration > T_drift:
+            #     # trigger ultra-slow momentum update for AE (EMA: tau=0.0001)
+            #     pass
                 
             loss_total = loss_ppo.mean() + loss_cl + loss_ewc + loss_ae
             

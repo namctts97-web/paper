@@ -1,5 +1,6 @@
 import gym
 from gym import spaces
+from scipy.special import logsumexp
 import numpy as np
 import random
 from edge_sim_py import *
@@ -164,7 +165,7 @@ class ResidualIoVEnv(gym.Env):
         # 数值保护：防止信道增益过小导致速率为 0
         return max(1e-3, abs(vehicle.h_t))
 
-    def apply_kkt_projection(self, raw_actions, estimated_rates):
+    def greedy_knapsack_projection(self, raw_actions, estimated_rates):
         """
         [终极学术修正] 基于带约束松弛背包问题的 KKT 闭式解 (Closed-form KKT Projection)
         与物理信道 CSI 前向耦合
@@ -208,19 +209,35 @@ class ResidualIoVEnv(gym.Env):
         return legal_actions
 
     def step(self, raw_actions):
-        # [终极学术修正] 物理层前向耦合：提前计算瞬时 CSI
-        estimated_rates = []
+        # [终极学术修正] 物理层前向耦合：双轨制宏微观容量模型
+        K_micro_samples = 100
         offloading_count = sum(1 for a in raw_actions if a > 0)
         available_B = self.B / offloading_count if offloading_count > 0 else self.B
+        
+        estimated_rates_macro = []
+        all_R_samples = []
+        
         for i, v in enumerate(self.vehicles):
-            h_t = self.calculate_fading_rate(v)
+            # 宏观游走一次，得到此时刻的基准增益
+            macro_h = self.calculate_fading_rate(v) 
+            scale = max(1e-4, macro_h)
+            
+            # 微观快照：在 1秒 宏观跨度内采样 K 次
+            h_samples = np.random.rayleigh(scale=scale, size=K_micro_samples)
+            
             d_m = max(1e-4, math.sqrt(v.coordinates[0]**2 + v.coordinates[1]**2))
             path_loss = 127 + 30 * math.log10(d_m / 1000.0)
-            signal_power = self.p_i * h_t * (10**(-path_loss/10))
-            estimated_rates.append(available_B * math.log2(1 + signal_power / self.noise_power))
+            signal_power_samples = self.p_i * (h_samples**2) * (10**(-path_loss/10))
+            
+            # 瞬时容量微观样本
+            R_samples = available_B * np.log2(1 + signal_power_samples / self.noise_power)
+            all_R_samples.append(R_samples)
+            
+            # GKP 准入控制需要一个宏观预估速率，此处使用遍历容量作为基准
+            estimated_rates_macro.append(np.mean(R_samples))
 
-        # 1. 经过物理信道耦合的 KKT 准入控制
-        legal_actions = self.apply_kkt_projection(raw_actions, estimated_rates)
+        # 1. 经过物理信道耦合的 GKP 准入控制 (原 KKT)
+        legal_actions = self.greedy_knapsack_projection(raw_actions, estimated_rates_macro)
         self.current_step_actions = legal_actions # 让 _algorithm_wrapper 去执行合法的
         
         # 2. 计算乒乓惩罚 (必须使用 legal_actions 和上一次的 legal_actions 比较)
@@ -269,15 +286,24 @@ class ResidualIoVEnv(gym.Env):
         reward_list = []
         
         for i, v in enumerate(self.vehicles):
-            # 注意：此处 h_t 已经在前向耦合阶段提前计算过了，直接使用，严禁二次推进随机游走！
-            d_m = max(1e-4, math.sqrt(v.coordinates[0]**2 + v.coordinates[1]**2))
-            path_loss = 127 + 30 * math.log10(d_m / 1000.0)
-            signal_power = self.p_i * max(1e-3, abs(v.h_t)) * (10**(-path_loss/10))
-            
-            # 使用真实的合法动作人数重算带宽共享
+            # 重新根据 legal_actions 计算最终共享带宽
             actual_offloading_count = sum(1 for a in legal_actions if a > 0)
             actual_available_B = self.B / actual_offloading_count if actual_offloading_count > 0 else self.B
-            rate = actual_available_B * math.log2(1 + signal_power / self.noise_power)
+            
+            # 复用刚刚生成的微观速率，按带宽比例放缩
+            R_samples_actual = all_R_samples[i] * (actual_available_B / available_B) if available_B > 0 else all_R_samples[i]
+            
+            # 双轨制计算物理速率
+            if v.lambda_i > 0.6:
+                # URLLC 任务：使用 Effective Capacity (有效容量) 严防深衰落中断
+                theta = 0.05 # QoS 指数
+                # C_eff = - (1/theta) * (logsumexp(-theta * R) - log(K))
+                X = -theta * R_samples_actual
+                c_eff = - (1.0 / theta) * (logsumexp(X) - math.log(K_micro_samples))
+                rate = max(1e-3, c_eff)
+            else:
+                # eMBB 任务：使用 Ergodic Capacity (遍历容量) 
+                rate = max(1e-3, np.mean(R_samples_actual))
             
             U = v.U_i
             D = v.D_i

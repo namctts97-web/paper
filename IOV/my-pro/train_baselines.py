@@ -22,9 +22,11 @@ def pretrain_algorithm(algo_name, agent, env, max_episodes=2000, save_path=""):
         
         for t in range(steps_per_episode):
             if algo_name == 'gcn':
-                action, logprob, val = agent.select_action(state)
+                res = agent.select_action(state)
+                action, logprob, val = res[0], res[1], res[2]
             else:
-                action, logprob, val, _ = agent.select_action(state)
+                res = agent.select_action(state)
+                action, logprob, val = res[0], res[1], res[2]
                 
             next_state, reward, done, info = env.step(action)
             agent.store_transition((state, action, logprob, reward, done))
@@ -53,8 +55,8 @@ def main():
     action_dim = len(env.vehicles) * 4
     
     # 1. Train PPO Baseline (Normal PPO, no expert, no CL)
-    # ppo_agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=3e-4, ablation_mode='ppo')
-    # pretrain_algorithm('ppo', ppo_agent, env, max_episodes=2000, save_path='model/ppo_converged.pth')
+    ppo_agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=3e-4, ablation_mode='ppo')
+    pretrain_algorithm('ppo', ppo_agent, env, max_episodes=2000, save_path='model/ppo_converged.pth')
     
     # 2. Train GCN Baseline
     # gcn_agent = GCN_PPO_Agent(lr=3e-4)

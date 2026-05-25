@@ -2,257 +2,169 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import numpy as np
 import torch
+import random
 import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor
 
 from my_iov_env import ResidualIoVEnv
 from residual_ppo_agent import ResidualPPOAgent
-from baseline_gcn_ppo import GCN_PPO_Agent
-from baseline_heuristic import Heuristic_Agent
-import torch.nn as nn
-from torch.distributions import Categorical
-
-class Legacy_ActorCritic(nn.Module):
-    def __init__(self, feature_dim=7, action_dim=4):
-        super(Legacy_ActorCritic, self).__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(feature_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_dim)
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(42, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-    def forward_actor(self, state):
-        return self.actor(state)
-
-class LegacyPPOAgent:
-    def __init__(self, state_dim=42, action_dim=24):
-        self.device = torch.device('cpu')
-        self.policy = Legacy_ActorCritic(feature_dim=7, action_dim=4).to(self.device)
-    def load_model(self, path):
-        self.policy.load_state_dict(torch.load(path, map_location='cpu'))
-    def select_action(self, state):
-        state = torch.FloatTensor(state).to(self.device)
-        N = state.shape[0]
-        with torch.no_grad():
-            x = state.view(-1, 7)
-            logits = self.policy.actor(x).view(N, 4)
-            val = self.policy.critic(state.view(-1))
-            dist = Categorical(logits=logits)
-            action = dist.sample()
-            action_logprob = dist.log_prob(action).sum()
-        return action.cpu().numpy(), action_logprob.item(), val.item(), 0.0
-    def store_transition(self, transition):
-        pass
-    def update(self):
-        pass
 
 def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
+    random.seed(seed)
 
-def run_evaluation(algo_name, max_episodes=500):
-    print(f"\n==============================================")
-    print(f"=== Online Adaptation Phase: {algo_name.upper()} ===")
-    print(f"==============================================")
-    
-    # 强制重置种子，保证每个算法遭遇完全一致的物理环境和灾难序列
-    set_seed(42)
+def run_evaluation(algo_name, seed, max_episodes=2000):
+    set_seed(seed)
     env = ResidualIoVEnv()
-    
     sample_state = env.reset()
     flat_state_dim = sample_state.flatten().shape[0]
     action_dim = len(env.vehicles) * 4
-    
-    # 初始化并加载“完全体”预训练模型，学习率设为极小值 1e-5
     lr_online = 1e-5
     
-    if algo_name == 'worst_fit':
-        agent = Heuristic_Agent()
-    elif algo_name == 'gcn':
-        agent = GCN_PPO_Agent(lr=lr_online)
-        agent.load_model('model/gcn_converged.pth')
-    elif algo_name == 'ppo':
-        agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='ppo')
+    agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode=algo_name)
+    
+    # 加载模型
+    if algo_name == 'ppo':
         agent.load_model('model/ppo_converged.pth')
-    elif algo_name == 'prior':
-        agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='prior')
-        agent.load_expert('model/prior_dnn_expert.pth')
     elif algo_name == 'ours':
-        agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='ours')
         agent.load_expert('model/prior_dnn_expert.pth')
         agent.load_model('model/ours_converged.pth')
     elif algo_name == 'ablation_hardclip':
-        agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='ablation_hardclip')
         agent.load_expert('model/prior_dnn_expert.pth')
         agent.load_model('model/hardclip_converged.pth')
     elif algo_name == 'ablation_nogate':
-        agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='ablation_nogate')
         agent.load_expert('model/prior_dnn_expert.pth')
         agent.load_model('model/nogate_converged.pth')
         
     steps_per_episode = 200
-    
-    hist_latency, hist_energy, hist_success, hist_cost = [], [], [], []
-    hist_brain_waves = [] # 记录 Gate G(t) 
-    hist_mse = []
-    hist_entropy = []
+    hist_cost = []
+    hist_gate = []
     
     for episode in range(1, max_episodes + 1):
-        # 统一的灾难时间线
-        if episode == 100: env.trigger_capacity_avalanche()
-        elif episode == 200: env.recover_from_avalanche()
-        elif episode == 300: env.trigger_traffic_flood()
-        elif episode == 400: env.recover_from_flood()
-            
+        # 严格的灾难时间线
+        if episode == 500: env.trigger_capacity_avalanche()
+        elif episode == 800: env.recover_from_avalanche()
+        elif episode == 1300: env.trigger_traffic_flood()
+        elif episode == 1600: env.recover_from_flood()
+        
         state = env.reset()
-        ep_latency, ep_energy, ep_success, ep_cost = 0, 0, 0, 0
-        ep_brain_wave = []
-        
+        ep_cost = 0
+        ep_bw = []
         for t in range(steps_per_episode):
-            if algo_name == 'gcn':
-                action, logprob, val = agent.select_action(state)
-            elif algo_name == 'worst_fit':
-                action = agent.select_action(state)
-            else:
-                action, logprob, val, bw = agent.select_action(state)
-                if algo_name in ['ours', 'ablation_nogate']: ep_brain_wave.append(bw)
-                
+            res = agent.select_action(state)
+            action, logprob, bw = res[0], res[1], res[3]
             next_state, reward, done, info = env.step(action)
-            
-            if algo_name in ['ours', 'ppo', 'gcn']:
-                agent.store_transition((state, action, logprob, reward, done))
-                
+            agent.store_transition((state, action, logprob, reward, done))
             state = next_state
-            ep_latency += info['avg_latency']
-            ep_energy += info['avg_energy']
-            ep_success += info['success_rate']
             ep_cost += info['avg_cost']
-            
+            ep_bw.append(bw)
             if done: break
-            
-        if algo_name in ['ours', 'ppo', 'gcn', 'ablation_hardclip', 'ablation_nogate']:
-            if algo_name in ['ours', 'ablation_hardclip', 'ablation_nogate']:
-                ep_mse, ep_ent = agent.update()
-                hist_mse.append(ep_mse)
-                hist_entropy.append(ep_ent)
-            else:
-                agent.update()
-            
-        avg_latency = ep_latency / steps_per_episode
-        avg_energy = ep_energy / steps_per_episode
-        avg_success = ep_success / steps_per_episode
-        avg_cost = ep_cost / steps_per_episode
+        agent.update()
         
-        hist_latency.append(avg_latency * 1000)
-        hist_energy.append(avg_energy)
-        hist_success.append(avg_success * 100)
+        avg_cost = ep_cost / steps_per_episode
         hist_cost.append(avg_cost)
-        if algo_name in ['ours', 'ablation_nogate']:
-            hist_brain_waves.append(np.mean(ep_brain_wave))
+        if algo_name == 'ours':
+            hist_gate.append(np.mean(ep_bw))
             
-        print(f"[{algo_name.upper()}] Ep {episode} | Latency: {avg_latency*1000:.1f}ms | Energy: {avg_energy:.2f}J | Cost: {avg_cost:.2f}")
+        if episode % 100 == 0:
+            print(f"[{algo_name.upper()} | Seed {seed}] Ep {episode} | Cost: {avg_cost:.2f}")
 
-    return hist_latency, hist_energy, hist_success, hist_cost, hist_brain_waves, hist_mse, hist_entropy
+    return hist_cost, hist_gate
 
-def smooth(scalars, weight=0.9):  
-    if not scalars: return scalars
+def worker(args):
+    return run_evaluation(*args)
+
+def smooth(scalars, weight=0.85):  
+    if len(scalars) == 0: return scalars
     last = scalars[0]
     smoothed = []
     for point in scalars:
         smoothed_val = last * weight + (1 - weight) * point
         smoothed.append(smoothed_val)
         last = smoothed_val
-    return smoothed
+    return np.array(smoothed)
 
 def main():
     os.makedirs('image', exist_ok=True)
+    algs = ['ours', 'ppo', 'ablation_hardclip']
+    seeds = [10, 20, 30, 40, 50]
     
-    # 运行所有算法收集数据
-    algs = ['ours', 'ablation_hardclip', 'ablation_nogate'] # 由于只想重构核心残差并产生消融图，这里只需运行相关变体
-    results = {}
+    results_cost = {alg: [] for alg in algs}
+    results_gate = []
+    
+    tasks = []
     for alg in algs:
-        results[alg] = run_evaluation(alg)
+        for seed in seeds:
+            tasks.append((alg, seed, 2000))
+            
+    print("\n[BENCHMARK] Starting multi-seed concurrent evaluation...")
+    with ProcessPoolExecutor(max_workers=min(os.cpu_count(), len(tasks))) as executor:
+        all_res = list(executor.map(worker, tasks))
         
-    # ==========================
-    # 绘制 1: Physical Benchmark (简化版，不再生成完整的 pb 图，只生成消融实验所需的图表)
-    # 物理性能对比已在之前验证过，本次仅输出 Ablation A 和 Ablation B
-    # ==========================
-    
-    # ==========================
-    # 绘制 2: Ablation Study A (Value Starvation & Entropy Collapse)
-    # ==========================
-    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # 子图1: Critic MSE Loss
-    smoothed_mse_ours = smooth(results['ours'][5], weight=0.8)
-    smoothed_mse_hard = smooth(results['ablation_hardclip'][5], weight=0.8)
-    axs[0].plot(range(1, 501), smoothed_mse_ours, color='tab:red', linewidth=2.5, label='OURS (RunningMeanStd + Arcsinh)')
-    axs[0].plot(range(1, 501), smoothed_mse_hard, color='tab:gray', linewidth=2.5, label='Ablation-HardClip (LayerNorm + np.clip)')
-    axs[0].set_yscale('log')
-    axs[0].set_xlabel('Episodes (Testing)')
-    axs[0].set_ylabel('Critic MSE Loss (Log Scale)')
-    axs[0].set_title('Critic Value Starvation Analysis')
-    axs[0].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
-    axs[0].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
-    axs[0].legend(loc='best')
-    axs[0].grid(True, linestyle='--', alpha=0.7)
-    
-    # 子图2: Policy Entropy
-    smoothed_ent_ours = smooth(results['ours'][6], weight=0.8)
-    smoothed_ent_hard = smooth(results['ablation_hardclip'][6], weight=0.8)
-    axs[1].plot(range(1, 501), smoothed_ent_ours, color='tab:red', linewidth=2.5, label='OURS')
-    axs[1].plot(range(1, 501), smoothed_ent_hard, color='tab:gray', linewidth=2.5, label='Ablation-HardClip')
-    axs[1].set_xlabel('Episodes (Testing)')
-    axs[1].set_ylabel('Policy Entropy')
-    axs[1].set_title('Policy Entropy Collapse Analysis')
-    axs[1].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
-    axs[1].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
-    axs[1].legend(loc='best')
-    axs[1].grid(True, linestyle='--', alpha=0.7)
-    
-    plt.tight_layout()
-    plt.savefig('image/ablation_A_starvation_entropy.png', dpi=300)
-    print("[OK] Ablation A plot saved.")
+    idx = 0
+    for alg in algs:
+        for seed in seeds:
+            cost, gate = all_res[idx]
+            results_cost[alg].append(cost)
+            if alg == 'ours':
+                results_gate.append(gate)
+            idx += 1
+            
+    def get_stats(data):
+        data = np.array(data)
+        return np.mean(data, axis=0), np.std(data, axis=0)
 
-    # ==========================
-    # 绘制 3: Ablation Study B (Dynamic Gate G vs Static Gate)
-    # ==========================
-    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+    x = np.arange(1, 2001)
+
+    # =========================================================
+    # 图 1: Gate Radar (门控 G(t) 的雷达图，验证异常检测隔离性能)
+    # =========================================================
+    mean_gate, std_gate = get_stats(results_gate)
+    plt.figure(figsize=(10, 4))
+    plt.plot(x, mean_gate, color='purple', label='Gate G(t)', linewidth=2.0)
+    plt.fill_between(x, np.clip(mean_gate-std_gate, 0, 1), np.clip(mean_gate+std_gate, 0, 1), color='purple', alpha=0.3)
     
-    # 子图1: Gate G(t) 变化趋势
-    bw_ours = smooth(results['ours'][4], weight=0.8)
-    bw_nogate = smooth(results['ablation_nogate'][4], weight=0.8)
-    axs[0].plot(range(1, 501), bw_ours, color='purple', linewidth=2.0, label='OURS (Dynamic Gate G)')
-    axs[0].plot(range(1, 501), bw_nogate, color='gray', linewidth=2.0, linestyle='--', label='Ablation-NoGate (G=1.0)')
-    axs[0].set_xlabel('Episodes (Testing)')
-    axs[0].set_ylabel('Gate Value G(t)')
-    axs[0].set_title('Dynamic Gate OOD Detection')
-    axs[0].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
-    axs[0].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
-    axs[0].legend(loc='best')
-    axs[0].grid(True, linestyle='--', alpha=0.5)
-    
-    # 子图2: 和平期收敛代价 (Overall System Cost)
-    cost_ours = smooth(results['ours'][3], weight=0.8)
-    cost_nogate = smooth(results['ablation_nogate'][3], weight=0.8)
-    axs[1].plot(range(1, 501), cost_ours, color='tab:red', linewidth=2.5, label='OURS (Dynamic Gate G)')
-    axs[1].plot(range(1, 501), cost_nogate, color='tab:gray', linewidth=2.5, label='Ablation-NoGate (G=1.0)')
-    axs[1].set_xlabel('Episodes (Testing)')
-    axs[1].set_ylabel('Overall System Cost')
-    axs[1].set_title('Performance Cost Penalty (Normal vs Disaster)')
-    axs[1].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
-    axs[1].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
-    axs[1].legend(loc='best')
-    axs[1].grid(True, linestyle='--', alpha=0.5)
-    
+    plt.axvspan(500, 800, color='red', alpha=0.1, label='OOD: Avalanche')
+    plt.axvspan(1300, 1600, color='blue', alpha=0.1, label='OOD: Flood')
+    plt.ylim(-0.1, 1.1)
+    plt.legend(loc='upper right')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.title("Gate G(t) Radar Tracker (2000 Episodes, 5 Seeds)")
+    plt.xlabel("Episodes")
+    plt.ylabel("G(t)")
     plt.tight_layout()
-    plt.savefig('image/ablation_B_gate_cost.png', dpi=300)
-    print("[OK] Ablation B (Brain waves / Gate) plot saved.")
+    plt.savefig('image/gate_radar.png', dpi=300)
+    print("\n[OK] Generated gate_radar.png")
+    
+    # =========================================================
+    # 图 2: Long term ablation (2000 轮超长周期基线与消融对比图)
+    # =========================================================
+    plt.figure(figsize=(12, 6))
+    colors = {'ours': 'red', 'ppo': 'gray', 'ablation_hardclip': 'blue'}
+    labels = {'ours': 'OURS (Dual-Brain Res-Gating)', 'ppo': 'Standard PPO Baseline', 'ablation_hardclip': 'Ablation-HardClip'}
+    
+    for alg in algs:
+        mean_c, std_c = get_stats(results_cost[alg])
+        mean_c_smooth = smooth(mean_c, 0.9)
+        std_c_smooth = smooth(std_c, 0.9)
+        
+        plt.plot(x, mean_c_smooth, color=colors[alg], label=labels[alg], linewidth=2.0)
+        plt.fill_between(x, mean_c_smooth - std_c_smooth, mean_c_smooth + std_c_smooth, color=colors[alg], alpha=0.2)
+        
+    plt.axvspan(500, 800, color='red', alpha=0.1, label='OOD: Avalanche')
+    plt.axvspan(1300, 1600, color='blue', alpha=0.1, label='OOD: Flood')
+    
+    # 根据跑出的范围，如果Cost过大，可能需要把ylim放到更大，这里先自适应
+    # plt.ylim(0, 50) 
+    plt.legend(loc='upper left')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.title("2000-Episode Zero-Shot Resilience Benchmark with 95% Confidence Intervals")
+    plt.xlabel("Episodes")
+    plt.ylabel("System Penalty (Cost)")
+    plt.tight_layout()
+    plt.savefig('image/long_term_ablation_curve.png', dpi=300)
+    print("[OK] Generated long_term_ablation_curve.png")
 
 if __name__ == "__main__":
     main()
