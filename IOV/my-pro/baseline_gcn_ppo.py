@@ -62,14 +62,19 @@ class GCN_ActorCritic(nn.Module):
         return action_logits, value
 
 class GCN_PPO_Agent:
-    def __init__(self, N_vehicles=6, feature_dim=6, action_dim=4, lr=3e-4, gamma=0.99, K_epochs=4, eps_clip=0.2):
+    def __init__(self, N_vehicles=6, feature_dim=7, action_dim=4, lr=1e-4, gamma=0.99, K_epochs=4, eps_clip=0.2):
         self.device = torch.device("cpu")
         self.N = N_vehicles
         
         self.policy = GCN_ActorCritic(N_vehicles, feature_dim, action_dim).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        
         self.MseLoss = nn.MSELoss()
+        self.buffer = []
         
     def build_adjacency_matrix(self, state):
         # 简单全连接拓扑（根据距离反比构建边权重）
@@ -83,8 +88,63 @@ class GCN_PPO_Agent:
         adj = self.build_adjacency_matrix(state)
         
         with torch.no_grad():
-            action_logits, _ = self.policy(state, adj)
+            action_logits, value = self.policy(state, adj)
             dist = Categorical(logits=action_logits[0])
             action = dist.sample()
+            action_logprob = dist.log_prob(action).sum()
             
-        return action.cpu().numpy()
+        return action.cpu().numpy(), action_logprob.item(), value.item()
+
+    def store_transition(self, transition):
+        self.buffer.append(transition)
+
+    def update(self):
+        if len(self.buffer) == 0:
+            return
+            
+        states = torch.FloatTensor(np.array([t[0] for t in self.buffer])).to(self.device)
+        actions = torch.FloatTensor(np.array([t[1] for t in self.buffer])).to(self.device)
+        old_logprobs = torch.FloatTensor(np.array([t[2] for t in self.buffer])).to(self.device)
+        rewards = [t[3] / 10.0 for t in self.buffer]
+        is_terminals = [t[4] for t in self.buffer]
+        
+        returns = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(rewards), reversed(is_terminals)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            returns.insert(0, discounted_reward)
+            
+        returns = torch.FloatTensor(returns).to(self.device)
+        
+        for _ in range(self.K_epochs):
+            adj = self.build_adjacency_matrix(states)
+            action_logits, values = self.policy(states, adj)
+            dist = Categorical(logits=action_logits)
+            
+            logprobs = dist.log_prob(actions).sum(dim=1)
+            dist_entropy = dist.entropy().sum(dim=1)
+            
+            advantages = returns - values.squeeze().detach()
+            if advantages.std() > 1e-6:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                
+            ratios = torch.exp(logprobs - old_logprobs)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values.squeeze(), returns) - 0.01 * dist_entropy
+            
+            self.optimizer.zero_grad()
+            loss.mean().backward()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+            self.optimizer.step()
+            
+        self.buffer = []
+
+    def save_model(self, path):
+        torch.save(self.policy.state_dict(), path)
+
+    def load_model(self, path):
+        self.policy.load_state_dict(torch.load(path, map_location=self.device))
