@@ -86,11 +86,21 @@ def run_evaluation(algo_name, max_episodes=500):
         agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='ours')
         agent.load_expert('model/prior_dnn_expert.pth')
         agent.load_model('model/ours_converged.pth')
+    elif algo_name == 'ablation_hardclip':
+        agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='ablation_hardclip')
+        agent.load_expert('model/prior_dnn_expert.pth')
+        agent.load_model('model/hardclip_converged.pth')
+    elif algo_name == 'ablation_nogate':
+        agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=lr_online, ablation_mode='ablation_nogate')
+        agent.load_expert('model/prior_dnn_expert.pth')
+        agent.load_model('model/nogate_converged.pth')
         
     steps_per_episode = 200
     
     hist_latency, hist_energy, hist_success, hist_cost = [], [], [], []
-    hist_brain_waves = [] # 仅 ours 记录
+    hist_brain_waves = [] # 记录 Gate G(t) 
+    hist_mse = []
+    hist_entropy = []
     
     for episode in range(1, max_episodes + 1):
         # 统一的灾难时间线
@@ -110,7 +120,7 @@ def run_evaluation(algo_name, max_episodes=500):
                 action = agent.select_action(state)
             else:
                 action, logprob, val, bw = agent.select_action(state)
-                if algo_name == 'ours': ep_brain_wave.append(bw)
+                if algo_name in ['ours', 'ablation_nogate']: ep_brain_wave.append(bw)
                 
             next_state, reward, done, info = env.step(action)
             
@@ -125,8 +135,13 @@ def run_evaluation(algo_name, max_episodes=500):
             
             if done: break
             
-        if algo_name in ['ours', 'ppo', 'gcn']:
-            agent.update()
+        if algo_name in ['ours', 'ppo', 'gcn', 'ablation_hardclip', 'ablation_nogate']:
+            if algo_name in ['ours', 'ablation_hardclip', 'ablation_nogate']:
+                ep_mse, ep_ent = agent.update()
+                hist_mse.append(ep_mse)
+                hist_entropy.append(ep_ent)
+            else:
+                agent.update()
             
         avg_latency = ep_latency / steps_per_episode
         avg_energy = ep_energy / steps_per_episode
@@ -137,12 +152,12 @@ def run_evaluation(algo_name, max_episodes=500):
         hist_energy.append(avg_energy)
         hist_success.append(avg_success * 100)
         hist_cost.append(avg_cost)
-        if algo_name == 'ours':
+        if algo_name in ['ours', 'ablation_nogate']:
             hist_brain_waves.append(np.mean(ep_brain_wave))
             
         print(f"[{algo_name.upper()}] Ep {episode} | Latency: {avg_latency*1000:.1f}ms | Energy: {avg_energy:.2f}J | Cost: {avg_cost:.2f}")
 
-    return hist_latency, hist_energy, hist_success, hist_cost, hist_brain_waves
+    return hist_latency, hist_energy, hist_success, hist_cost, hist_brain_waves, hist_mse, hist_entropy
 
 def smooth(scalars, weight=0.9):  
     if not scalars: return scalars
@@ -158,84 +173,86 @@ def main():
     os.makedirs('image', exist_ok=True)
     
     # 运行所有算法收集数据
-    algs = ['gcn', 'ppo', 'prior', 'ours']
+    algs = ['ours', 'ablation_hardclip', 'ablation_nogate'] # 由于只想重构核心残差并产生消融图，这里只需运行相关变体
     results = {}
     for alg in algs:
         results[alg] = run_evaluation(alg)
         
     # ==========================
-    # 绘制 1: Physical Benchmark
+    # 绘制 1: Physical Benchmark (简化版，不再生成完整的 pb 图，只生成消融实验所需的图表)
+    # 物理性能对比已在之前验证过，本次仅输出 Ablation A 和 Ablation B
     # ==========================
-    fig, axs = plt.subplots(2, 2, figsize=(16, 10))
-    metrics = [
-        ("System Latency (ms)", 0, axs[0, 0]),
-        ("Energy Consumption (Joules)", 1, axs[0, 1]),
-        ("Task Success Rate (%)", 2, axs[1, 0]),
-        ("Overall System Cost", 3, axs[1, 1])
-    ]
-    colors_pb = {'worst_fit': 'tab:gray', 'ppo': 'tab:orange', 'gcn': 'tab:blue', 'ours': 'tab:red'}
-    labels_pb = {'worst_fit': 'Heuristic (Worst-Fit)', 'ppo': 'Standard DRL (PPO)', 'gcn': 'Topology-Aware (GCN-DRL)', 'ours': 'Dual-Brain ER-CL (Ours)'}
-    
-    for metric_name, idx, ax in metrics:
-        for alg in ['ppo', 'gcn', 'ours']:
-            smoothed_data = smooth(results[alg][idx], weight=0.8)
-            if idx == 0:
-                ax.set_yscale('log')
-                ax.set_ylabel(metric_name + " (Log Scale)")
-            else:
-                ax.set_ylabel(metric_name)
-            ax.plot(range(1, 501), smoothed_data, color=colors_pb[alg], linewidth=2.5, label=labels_pb[alg])
-            
-        ax.set_xlabel('Episodes (Testing)')
-        ax.axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
-        ax.axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
-        ax.legend(loc='best')
-        ax.grid(True, linestyle='--', alpha=0.5)
-        
-    fig.suptitle('System-Level Physical Benchmarks under OOD Disasters', fontsize=16, fontweight='bold')
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig('image/physical_benchmark.png', dpi=300)
-    print("\n[OK] Physical benchmark plots saved.")
     
     # ==========================
-    # 绘制 2: Ablation Curve
+    # 绘制 2: Ablation Study A (Value Starvation & Entropy Collapse)
     # ==========================
-    plt.figure(figsize=(10, 6))
-    colors_ab = {'prior': 'tab:green', 'ppo': 'tab:orange', 'ours': 'tab:red'}
-    labels_ab = {'prior': 'Prior Expert Only', 'ppo': 'Residual PPO (No ER-CL)', 'ours': 'Dual-Brain ER-CL (Ours)'}
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
     
-    for alg in ['prior', 'ppo', 'ours']:
-        # Ablation 画的是 Cost
-        smoothed_data = smooth(results[alg][3], weight=0.85)
-        plt.plot(range(1, 501), smoothed_data, color=colors_ab[alg], linewidth=2.5, label=labels_ab[alg])
-        
-    plt.xlabel('Episodes (Testing)')
-    plt.ylabel('Overall System Cost')
-    plt.title('Ablation Study: Zero-Shot Recovery vs Catastrophic Forgetting')
-    plt.axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
-    plt.axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
-    plt.legend(loc='best')
-    plt.grid(True, linestyle='--', alpha=0.7)
+    # 子图1: Critic MSE Loss
+    smoothed_mse_ours = smooth(results['ours'][5], weight=0.8)
+    smoothed_mse_hard = smooth(results['ablation_hardclip'][5], weight=0.8)
+    axs[0].plot(range(1, 501), smoothed_mse_ours, color='tab:red', linewidth=2.5, label='OURS (RunningMeanStd + Arcsinh)')
+    axs[0].plot(range(1, 501), smoothed_mse_hard, color='tab:gray', linewidth=2.5, label='Ablation-HardClip (LayerNorm + np.clip)')
+    axs[0].set_yscale('log')
+    axs[0].set_xlabel('Episodes (Testing)')
+    axs[0].set_ylabel('Critic MSE Loss (Log Scale)')
+    axs[0].set_title('Critic Value Starvation Analysis')
+    axs[0].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
+    axs[0].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
+    axs[0].legend(loc='best')
+    axs[0].grid(True, linestyle='--', alpha=0.7)
+    
+    # 子图2: Policy Entropy
+    smoothed_ent_ours = smooth(results['ours'][6], weight=0.8)
+    smoothed_ent_hard = smooth(results['ablation_hardclip'][6], weight=0.8)
+    axs[1].plot(range(1, 501), smoothed_ent_ours, color='tab:red', linewidth=2.5, label='OURS')
+    axs[1].plot(range(1, 501), smoothed_ent_hard, color='tab:gray', linewidth=2.5, label='Ablation-HardClip')
+    axs[1].set_xlabel('Episodes (Testing)')
+    axs[1].set_ylabel('Policy Entropy')
+    axs[1].set_title('Policy Entropy Collapse Analysis')
+    axs[1].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
+    axs[1].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
+    axs[1].legend(loc='best')
+    axs[1].grid(True, linestyle='--', alpha=0.7)
+    
     plt.tight_layout()
-    plt.savefig('image/ablation_curve.png', dpi=300)
-    print("[OK] Ablation curve saved.")
+    plt.savefig('image/ablation_A_starvation_entropy.png', dpi=300)
+    print("[OK] Ablation A plot saved.")
+
+    # ==========================
+    # 绘制 3: Ablation Study B (Dynamic Gate G vs Static Gate)
+    # ==========================
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
     
-    # ==========================
-    # 绘制 3: Brain Waves
-    # ==========================
-    plt.figure(figsize=(10, 4))
-    bw_data = smooth(results['ours'][4], weight=0.8)
-    plt.plot(range(1, 501), bw_data, color='purple', linewidth=2.0)
-    plt.xlabel('Episodes (Testing)')
-    plt.ylabel('Mean Magnitude of $|\\Delta$ Logits|')
-    plt.title('Brain Waves Analysis: Right Brain Global Intervention Intensity')
-    plt.axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
-    plt.axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
-    plt.legend(loc='best')
-    plt.grid(True, linestyle='--', alpha=0.5)
+    # 子图1: Gate G(t) 变化趋势
+    bw_ours = smooth(results['ours'][4], weight=0.8)
+    bw_nogate = smooth(results['ablation_nogate'][4], weight=0.8)
+    axs[0].plot(range(1, 501), bw_ours, color='purple', linewidth=2.0, label='OURS (Dynamic Gate G)')
+    axs[0].plot(range(1, 501), bw_nogate, color='gray', linewidth=2.0, linestyle='--', label='Ablation-NoGate (G=1.0)')
+    axs[0].set_xlabel('Episodes (Testing)')
+    axs[0].set_ylabel('Gate Value G(t)')
+    axs[0].set_title('Dynamic Gate OOD Detection')
+    axs[0].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
+    axs[0].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
+    axs[0].legend(loc='best')
+    axs[0].grid(True, linestyle='--', alpha=0.5)
+    
+    # 子图2: 和平期收敛代价 (Overall System Cost)
+    cost_ours = smooth(results['ours'][3], weight=0.8)
+    cost_nogate = smooth(results['ablation_nogate'][3], weight=0.8)
+    axs[1].plot(range(1, 501), cost_ours, color='tab:red', linewidth=2.5, label='OURS (Dynamic Gate G)')
+    axs[1].plot(range(1, 501), cost_nogate, color='tab:gray', linewidth=2.5, label='Ablation-NoGate (G=1.0)')
+    axs[1].set_xlabel('Episodes (Testing)')
+    axs[1].set_ylabel('Overall System Cost')
+    axs[1].set_title('Performance Cost Penalty (Normal vs Disaster)')
+    axs[1].axvspan(100, 200, color='red', alpha=0.1, label='OOD: Avalanche')
+    axs[1].axvspan(300, 400, color='orange', alpha=0.1, label='OOD: Flood')
+    axs[1].legend(loc='best')
+    axs[1].grid(True, linestyle='--', alpha=0.5)
+    
     plt.tight_layout()
-    plt.savefig('image/brain_waves.png', dpi=300)
-    print("[OK] Brain waves plot saved.")
+    plt.savefig('image/ablation_B_gate_cost.png', dpi=300)
+    print("[OK] Ablation B (Brain waves / Gate) plot saved.")
 
 if __name__ == "__main__":
     main()

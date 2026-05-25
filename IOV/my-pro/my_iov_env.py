@@ -6,8 +6,9 @@ from edge_sim_py import *
 import math
 from baseline.env_v2_core import get_env_params_v2
 class ResidualIoVEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, ablation_mode='ours'):
         super(ResidualIoVEnv, self).__init__()
+        self.ablation_mode = ablation_mode
         self.disaster_count = 0
         
         # 核心物理参数对齐 (调用 V2 接口)
@@ -322,10 +323,14 @@ class ResidualIoVEnv(gym.Env):
             if T_i <= self.T_max:
                 success_count += 1
             else:
-                # [终极学术修正] Arcsinh 渐进有界漂移罚函数 (Float32 精度安全)
                 x = (T_i - self.T_max) / self.T_max
-                penalty_ratio = 1.0 + (self.V_max - 1.0) * np.arcsinh(2.0 * x)
-                Cost_actual = Cost_local * penalty_ratio
+                if self.ablation_mode == 'ablation_hardclip':
+                    # [消融实验 A] 关闭 Arcsinh 保护，使用简单的线性罚函数 (后面会进行 Hard Clip)
+                    Cost_actual = Cost_local * (1.0 + x)
+                else:
+                    # [终极学术修正] Arcsinh 渐进有界漂移罚函数 (Float32 精度安全)
+                    penalty_ratio = 1.0 + (self.V_max - 1.0) * np.arcsinh(2.0 * x)
+                    Cost_actual = Cost_local * penalty_ratio
                 
             if raw_actions[i] > 0 and legal_actions[i] == 0:
                 # 被拒惩罚严格遵循李雅普诺夫下界最大比例

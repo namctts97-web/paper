@@ -83,8 +83,9 @@ class Prior_DNN(nn.Module):
         return self.net(state)
 
 class Residual_ActorCritic(nn.Module):
-    def __init__(self, feature_dim, action_dim, gate_temperature=50.0, ood_threshold=0.05):
+    def __init__(self, feature_dim, action_dim, gate_temperature=50.0, ood_threshold=0.05, ablation_mode='ours'):
         super(Residual_ActorCritic, self).__init__()
+        self.ablation_mode = ablation_mode
         self.gate_temperature = gate_temperature
         self.ood_threshold = ood_threshold
         
@@ -120,15 +121,20 @@ class Residual_ActorCritic(nn.Module):
         delta_logits = self.action_head(x)
         delta_logits = delta_logits.view(logits_prior.size())
         
-        action_comp = logits_prior + delta_logits
-        
         # [学术修正] 无监督物理异常检测 (使用白化后的状态)
         reconstructed, norm_state = self.autoencoder(state)
         recon_error = torch.mean((norm_state - reconstructed) ** 2, dim=-1, keepdim=True)
         
         # [学术修正] 移除魔法数字，使用网格搜索超参数
         gate = torch.sigmoid(self.gate_temperature * (recon_error.detach() - self.ood_threshold))
-        return gate * action_comp, gate, recon_error
+        
+        if hasattr(self, 'ablation_mode') and self.ablation_mode == 'ablation_nogate':
+            # [消融实验 B] 强制完全开启残差，破坏冷启动
+            gate = torch.ones_like(gate)
+        
+        # [代数坍缩修正] 绝对禁止在 forward_actor 内部再次叠加 logits_prior！
+        # 这里只允许输出纯净的门控残差修正量： G * NN_out
+        return gate * delta_logits, gate, recon_error
 
 class ResidualPPOAgent:
     def __init__(self, state_dim=42, action_dim=24, lr=1e-4, gamma=0.99, K_epochs=4, eps_clip=0.2, ablation_mode='ours', lambda_ewc=100.0, ood_threshold=0.05, gate_temperature=50.0):
@@ -143,7 +149,7 @@ class ResidualPPOAgent:
         
         # 提取前4维给左脑 (去除预警特征)
         self.prior_net = Prior_DNN(4, 4).to(self.device)
-        self.residual_net = Residual_ActorCritic(7, 4, gate_temperature, ood_threshold).to(self.device)
+        self.residual_net = Residual_ActorCritic(7, 4, gate_temperature, ood_threshold, ablation_mode).to(self.device)
         self.optimizer = optim.Adam(self.residual_net.parameters(), lr=lr)
         self.MseLoss = nn.MSELoss()
         
@@ -242,7 +248,7 @@ class ResidualPPOAgent:
 
     def update(self):
         if len(self.buffer) == 0:
-            return
+            return 0.0, 0.0
             
         states = torch.FloatTensor(np.array([t[0] for t in self.buffer])).to(self.device)
         actions = torch.FloatTensor(np.array([t[1] for t in self.buffer])).to(self.device)
@@ -260,10 +266,14 @@ class ResidualPPOAgent:
             
         returns = torch.FloatTensor(returns).to(self.device)
         
-        # [学术修正] 根治价值饥饿 (Value Starvation)
-        # 强制将压缩后的 Return 展宽至方差为 1.0 的尺度
-        self.ret_rms.update(returns)
-        normalized_returns = (returns - self.ret_rms.mean.detach()) / torch.sqrt(self.ret_rms.var.detach() + self.ret_rms.epsilon)
+        if self.ablation_mode == 'ablation_hardclip':
+            # [消融实验 A] 关闭 Return Normalization，验证价值饥饿
+            normalized_returns = returns
+        else:
+            # [学术修正] 根治价值饥饿 (Value Starvation)
+            # 强制将压缩后的 Return 展宽至方差为 1.0 的尺度
+            self.ret_rms.update(returns)
+            normalized_returns = (returns - self.ret_rms.mean.detach()) / torch.sqrt(self.ret_rms.var.detach() + self.ret_rms.epsilon)
         
         with torch.no_grad():
             initial_values = self.residual_net.critic(states.view(states.size(0), -1)).squeeze()
@@ -279,6 +289,9 @@ class ResidualPPOAgent:
         if len(self.ood_memory) > 2000:
             self.ood_memory = self.ood_memory[-2000:]
             
+        epoch_mse = []
+        epoch_entropy = []
+        
         for _ in range(self.K_epochs):
             prior_states = states[:, :, :4].clone()
             logits_prior = self.prior_net(prior_states)
@@ -303,7 +316,11 @@ class ResidualPPOAgent:
             surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
             
             # 使用 Normalized Returns 计算 Critic MSE Loss (彻底解除 Loss 过小不收敛的问题)
-            loss_ppo = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(values, normalized_returns) - 0.01 * dist_entropy 
+            critic_loss = self.MseLoss(values, normalized_returns)
+            loss_ppo = -torch.min(surr1, surr2) + critic_loss - 0.01 * dist_entropy 
+            
+            epoch_mse.append(critic_loss.mean().item())
+            epoch_entropy.append(dist_entropy.mean().item())
             
             loss_cl = torch.tensor(0.0).to(self.device)
             if self.ablation_mode == 'ours' and len(self.ood_memory) > 100:
@@ -313,8 +330,11 @@ class ResidualPPOAgent:
                 s_returns = torch.stack([s[2] for s in sampled]).to(self.device)
                 s_old_logprobs = torch.stack([s[3] for s in sampled]).to(self.device)
                 
-                # 对灾难记忆池的 Return 同样执行展宽
-                s_norm_returns = (s_returns - self.ret_rms.mean.detach()) / torch.sqrt(self.ret_rms.var.detach() + self.ret_rms.epsilon)
+                # 对灾难记忆池的 Return 同样执行展宽 (如果是硬截断消融则不执行)
+                if self.ablation_mode == 'ablation_hardclip':
+                    s_norm_returns = s_returns
+                else:
+                    s_norm_returns = (s_returns - self.ret_rms.mean.detach()) / torch.sqrt(self.ret_rms.var.detach() + self.ret_rms.epsilon)
                 
                 s_values = self.residual_net.critic(s_states.view(s_states.size(0), -1)).squeeze()
                 s_adv = s_norm_returns - s_values.detach()
@@ -355,4 +375,6 @@ class ResidualPPOAgent:
             nn.utils.clip_grad_norm_(self.residual_net.parameters(), max_norm=0.5)
             self.optimizer.step()
             
-        self.buffer = []
+        self.buffer.clear()
+        
+        return np.mean(epoch_mse) if len(epoch_mse) > 0 else 0.0, np.mean(epoch_entropy) if len(epoch_entropy) > 0 else 0.0
