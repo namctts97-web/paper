@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 import numpy as np
@@ -50,19 +51,24 @@ class StateAutoencoder(nn.Module):
         super(StateAutoencoder, self).__init__()
         # [学术修正] 废除 NLP 领域的 LayerNorm，引入强化学习标准的 RunningMeanStd
         self.norm = RunningMeanStd(shape=(feature_dim,))
+        # 强制特征隔离：自编码器只吃 4 个外生物理特征 (mec_load, r_ec_ratio, flood_mult, I_mean_norm)
+        self.exo_dim = 4
         self.encoder = nn.Sequential(
-            nn.Linear(feature_dim, 16),
+            nn.Linear(self.exo_dim, 16),
             nn.ReLU(),
             nn.Linear(16, 8)
         )
         self.decoder = nn.Sequential(
             nn.Linear(8, 16),
             nn.ReLU(),
-            nn.Linear(16, feature_dim)
+            nn.Linear(16, self.exo_dim)
         )
+        self.norm = nn.LayerNorm(self.exo_dim)
 
     def forward(self, x):
-        norm_x = self.norm(x)
+        # 提取外生特征 (特征 4, 5, 6, 7)
+        exo_x = x[..., 4:]
+        norm_x = self.norm(exo_x)
         encoded = self.encoder(norm_x)
         decoded = self.decoder(encoded)
         return decoded, norm_x
@@ -116,8 +122,8 @@ class Residual_ActorCritic(nn.Module):
             nn.Linear(64, 1)
         )
         
-        # [学术修正] 戴着镣铐跳舞的自适应温度参数
-        self.alpha = nn.Parameter(torch.zeros(1))
+        # [学术修正] 向量化独立温度参数 (初始化为 -2.0 打破冷启动悖论)
+        self.alpha = nn.Parameter(torch.ones(action_dim) * -2.0)
         self.R_max = 5.0
 
     def forward_actor(self, state, logits_prior):
@@ -137,25 +143,35 @@ class Residual_ActorCritic(nn.Module):
             gate = torch.ones_like(gate)
         
         # [代数坍缩修正] 绝对禁止在 forward_actor 内部再次叠加 logits_prior！
-        # 这里只允许输出纯净的门控残差修正量，并带有物理防爆边界 R_max
+        # 但我们使用 LayerNorm 保护 prior 的拓扑熵，防止右脑残差暴力覆写
+        # 返回被 gate 动态抑制的残差增量
         adaptive_scale = self.R_max * torch.sigmoid(self.alpha)
+        # 注意：此处输出 delta_logits，外层的 PPO agent 会执行 L_final = (1-g)*LayerNorm(L_prior) + g*delta
         return adaptive_scale * gate * delta_logits, gate, recon_error
 
 class ResidualPPOAgent:
     def __init__(self, state_dim=42, action_dim=24, lr=1e-4, gamma=0.99, K_epochs=4, eps_clip=0.2, ablation_mode='ours', lambda_ewc=100.0, ood_threshold=0.05, gate_temperature=50.0):
         self.ablation_mode = ablation_mode
+        self.lambda_ewc = lambda_ewc
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.residual_scale = 15.0
-        self.lambda_ewc = lambda_ewc
+        self.num_vehicles = action_dim // 4
+        feature_dim = state_dim // self.num_vehicles
         
         self.device = torch.device("cpu")
         
-        # 提取前4维给左脑 (去除预警特征)
-        self.prior_net = Prior_DNN(4, 4).to(self.device)
-        self.residual_net = Residual_ActorCritic(7, 4, gate_temperature, ood_threshold, ablation_mode).to(self.device)
-        self.optimizer = optim.Adam(self.residual_net.parameters(), lr=lr)
+        self.prior_net = Prior_DNN(feature_dim, 4).to(self.device)
+        self.residual_net = Residual_ActorCritic(feature_dim, 4, gate_temperature, ood_threshold, ablation_mode).to(self.device)
+        
+        # [学术修正] 学习率分层，给 alpha 设置绝对超级学习率 0.05
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in self.residual_net.named_parameters() if 'alpha' not in n], 'lr': lr},
+            {'params': self.residual_net.alpha, 'lr': 0.05} 
+        ]
+        self.optimizer = optim.Adam(optimizer_grouped_parameters)
+        
         self.MseLoss = nn.MSELoss()
         
         # [学术修正] 独立的回报归一化器，根治 Critic 价值饥饿
@@ -201,7 +217,7 @@ class ResidualPPOAgent:
             
             self.optimizer.zero_grad()
             
-            prior_x = s_state[:, :, :4].clone()
+            prior_x = s_state.clone()
             with torch.no_grad():
                 logits_prior = self.prior_net(prior_x)
                 logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0)
@@ -240,7 +256,7 @@ class ResidualPPOAgent:
     def select_action(self, state):
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         with torch.no_grad():
-            prior_x = state[:, :, :4].clone()
+            prior_x = state.clone()
             logits_prior = self.prior_net(prior_x)
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
@@ -249,10 +265,12 @@ class ResidualPPOAgent:
             if self.ablation_mode == 'prior':
                 logits_final = logits_prior.clone()
             elif self.ablation_mode == 'ppo':
-                # PPO baseline also gets the adaptive scale from forward_actor
                 logits_final = delta_logits.clone() 
-            else: 
-                logits_final = logits_prior + delta_logits
+            else:
+                # [熵坍缩防御] 动态温度反相缩放与 LayerNorm
+                # 使用均值为 0，方差为 1 的 LayerNorm 压平 prior 的极值，防止暴力覆盖
+                norm_prior = F.layer_norm(logits_prior, normalized_shape=logits_prior.size()[1:])
+                logits_final = (1.0 - gate) * norm_prior + gate * delta_logits
             
             value = self.residual_net.critic(state.view(state.size(0), -1))
             dist = Categorical(logits=logits_final)
@@ -311,7 +329,7 @@ class ResidualPPOAgent:
         epoch_entropy = []
         
         for _ in range(self.K_epochs):
-            prior_states = states[:, :, :4].clone()
+            prior_states = states.clone()
             logits_prior = self.prior_net(prior_states)
             logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0) 
             
@@ -361,7 +379,7 @@ class ResidualPPOAgent:
                 s_adv = (s_adv - s_adv.mean()) / (s_adv.std() + 1e-8)
                 
                 with torch.no_grad():
-                    s_logits_prior = self.prior_net(s_states[:, :, :4])
+                    s_logits_prior = self.prior_net(s_states)
                     s_logits_prior = torch.clamp(s_logits_prior, min=-5.0, max=5.0)
                 
                 s_delta_logits, _, _ = self.residual_net.forward_actor(s_states, s_logits_prior)

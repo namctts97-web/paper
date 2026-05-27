@@ -22,15 +22,15 @@ def train_bc_native_gpu():
     actions_np = np.array([sample['action'] for sample in raw_data], dtype=np.int64)
     
     # 【核心创新】：打碎集权大脑，把 10 万条全局经验拆解成 60 万条单车本能经验！
-    if len(states_np.shape) == 2 and states_np.shape[1] == 24:
-        states_np = states_np.reshape(-1, 4)
+    if len(states_np.shape) == 2 and states_np.shape[1] == 48:
+        states_np = states_np.reshape(-1, 8)
     else:
-        states_np = states_np[:, :, :4].reshape(-1, 4)
+        states_np = states_np.reshape(-1, 8)
     actions_np = actions_np.reshape(-1)
     
     print(f"Reshaped Dataset Shape for Parameter Sharing: States {states_np.shape}, Actions {actions_np.shape}")
     
-    state_dim = 4
+    state_dim = 8
     action_dim = 4 # 每辆车 4 个 Logits
     
     print("Moving ENTIRE dataset to GPU VRAM at once...")

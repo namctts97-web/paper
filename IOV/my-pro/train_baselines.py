@@ -67,17 +67,5 @@ def main():
     ours_agent.load_expert('model/prior_dnn_expert.pth')
     pretrain_algorithm('ours', ours_agent, env, max_episodes=2000, save_path='model/ours_converged.pth')
     
-    # 4. Train Ablation: HardClip (No Return-Norm, No Arcsinh)
-    env_hardclip = ResidualIoVEnv(ablation_mode='ablation_hardclip')
-    hardclip_agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=3e-4, ablation_mode='ablation_hardclip')
-    hardclip_agent.load_expert('model/prior_dnn_expert.pth')
-    pretrain_algorithm('ablation_hardclip', hardclip_agent, env_hardclip, max_episodes=2000, save_path='model/hardclip_converged.pth')
-    
-    # 5. Train Ablation: NoGate (Gate=1.0 constantly)
-    env_nogate = ResidualIoVEnv(ablation_mode='ablation_nogate')
-    nogate_agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=3e-4, ablation_mode='ablation_nogate')
-    nogate_agent.load_expert('model/prior_dnn_expert.pth')
-    pretrain_algorithm('ablation_nogate', nogate_agent, env_nogate, max_episodes=2000, save_path='model/nogate_converged.pth')
-
 if __name__ == "__main__":
     main()

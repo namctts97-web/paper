@@ -42,6 +42,34 @@ def worker_task(seed_val):
     # reset 是安全的，它不会无脑新增对象
     obs = env.reset()
     
+    # ==========================================
+    # 核心整改：环境数据增强 (Counterfactual Exploration)
+    # 防止网络学习到 eMBB 100% 上云的 Shortcut (状态-动作坍缩)
+    # ==========================================
+    rand_aug = np.random.rand()
+    if rand_aug < 0.20:
+        # 20% 概率：核心网切片带宽雪崩 (10Mbps - 50Mbps)
+        env.r_ec = random.uniform(10.0, 50.0) * 1e6
+        # 更新状态矩阵中给智能体看的特征
+        for i in range(n_tasks): obs[i][5] = env.r_ec / (500.0 * 1e6)
+    elif rand_aug < 0.30:
+        # 10% 概率：云端陷入极限拥塞 (传播抖动飙升到 0.5s - 1.0s)
+        # 注意：这里的 prop_ec_jitter 是环境在 step 和 expert 里动态生成的
+        # 为了让 expert 感知到，我们需要把它作为一个硬变量塞入 env，或者塞入 params
+        # 为了不破坏现有架构，我们可以直接给环境加一个标记
+        env.force_cloud_congestion = True
+    else:
+        env.force_cloud_congestion = False
+        
+    # 将 env 内动态生成的算力池注入到 params 字典中，供 expert 使用
+    params['f_local'] = env.f_local
+    params['f_mec'] = env.f_mec
+    params['f_offsite'] = env.f_offsite
+    # 由于环境不再有固定的 r_eo / r_ec 随机区间（已锁死 500M），直接读取环境中的值
+    params['r_eo'] = env.r_eo
+    params['r_ec'] = env.r_ec
+    params['force_cloud_congestion'] = getattr(env, 'force_cloud_congestion', False)
+    
     # 提取物理参数
     d_matrix = np.zeros(n_tasks)
     U_i = np.zeros(n_tasks)
