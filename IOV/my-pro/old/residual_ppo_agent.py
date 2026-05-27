@@ -135,8 +135,9 @@ class Residual_ActorCritic(nn.Module):
         reconstructed, norm_state = self.autoencoder(state)
         recon_error = torch.mean((norm_state - reconstructed) ** 2, dim=-1, keepdim=True)
         
-        # [学术修正] 移除魔法数字，使用网格搜索超参数
-        gate = torch.sigmoid(self.gate_temperature * (recon_error.detach() - self.ood_threshold))
+        # [学术修正] 基础残差底噪 (Base Residual Floor): 解决“次优性悖论”
+        # 即使在正常环境，门控也维持 0.2 的底噪，允许 RL 微调 prior，消除启发式算法的最优性间隙
+        gate = 0.2 + 0.8 * torch.sigmoid(self.gate_temperature * (recon_error.detach() - self.ood_threshold))
         
         if hasattr(self, 'ablation_mode') and self.ablation_mode == 'ablation_nogate':
             # [消融实验 B] 强制完全开启残差，破坏冷启动
@@ -145,8 +146,9 @@ class Residual_ActorCritic(nn.Module):
         # [代数坍缩修正] 绝对禁止在 forward_actor 内部再次叠加 logits_prior！
         # 但我们使用 LayerNorm 保护 prior 的拓扑熵，防止右脑残差暴力覆写
         # 返回被 gate 动态抑制的残差增量
+        # 返回被 gate 动态抑制的残差增量
         adaptive_scale = self.R_max * torch.sigmoid(self.alpha)
-        # 注意：此处输出 delta_logits，外层的 PPO agent 会执行 L_final = (1-g)*LayerNorm(L_prior) + g*delta
+        # 注意：此处输出 delta_logits，外层的 PPO agent 会执行 L_final = L_prior + delta (严格加法)
         return adaptive_scale * gate * delta_logits, gate, recon_error
 
 class ResidualPPOAgent:
@@ -267,10 +269,8 @@ class ResidualPPOAgent:
             elif self.ablation_mode == 'ppo':
                 logits_final = delta_logits.clone() 
             else:
-                # [熵坍缩防御] 动态温度反相缩放与 LayerNorm
-                # 使用均值为 0，方差为 1 的 LayerNorm 压平 prior 的极值，防止暴力覆盖
-                norm_prior = F.layer_norm(logits_prior, normalized_shape=logits_prior.size()[1:])
-                logits_final = (1.0 - gate) * norm_prior + gate * delta_logits
+                # [学术修正] 放弃凸组合，采用严格加法，允许 RL 始终在 prior 基础上微调
+                logits_final = logits_prior + delta_logits
             
             value = self.residual_net.critic(state.view(state.size(0), -1))
             dist = Categorical(logits=logits_final)

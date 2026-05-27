@@ -189,13 +189,21 @@ class ResidualIoVEnv(gym.Env):
             # SINR 与 OFDMA 资源分配
             sinr_samples = signal_power_samples / (self.noise_power + I_mean)
             
-            # MAC Preemption: URLLC 绝对抢占，eMBB 吃残羹冷炙
+            # MAC Preemption: Strict OFDMA slicing with priority weights
             N_U = sum(1 for j, vv in enumerate(self.vehicles) if vv.task_type == 'URLLC' and raw_actions[j] > 0)
             N_E = sum(1 for j, vv in enumerate(self.vehicles) if vv.task_type == 'eMBB' and raw_actions[j] > 0)
+            
+            # To compute hypothetical rate for non-offloading users, assume they join
+            temp_N_U = N_U + (1 if v.task_type == 'URLLC' and raw_actions[i] == 0 else 0)
+            temp_N_E = N_E + (1 if v.task_type == 'eMBB' and raw_actions[i] == 0 else 0)
+            
+            # Strict OFDMA slicing ensures sum(alloc_B) <= B
+            W_U, W_E = 4.0, 1.0
+            total_weight = max(1e-9, temp_N_U * W_U + temp_N_E * W_E)
             if v.task_type == 'URLLC':
-                alloc_B = self.B / max(1, N_U)
+                alloc_B = self.B * (W_U / total_weight)
             else:
-                alloc_B = self.B / max(1, N_U + N_E)
+                alloc_B = self.B * (W_E / total_weight)
                 
             R_samples = alloc_B * np.log2(1 + sinr_samples)
             
@@ -261,13 +269,19 @@ class ResidualIoVEnv(gym.Env):
             
             sinr_samples_actual = signal_power_samples / (self.noise_power + I_mean_actual)
             
-            # MAC Preemption (Actual Phase)
+            # MAC Preemption (Actual Phase): Strict OFDMA slicing
             actual_N_U = sum(1 for j, vv in enumerate(self.vehicles) if vv.task_type == 'URLLC' and legal_actions[j] > 0)
             actual_N_E = sum(1 for j, vv in enumerate(self.vehicles) if vv.task_type == 'eMBB' and legal_actions[j] > 0)
+            
+            temp_actual_N_U = actual_N_U + (1 if v.task_type == 'URLLC' and legal_actions[i] == 0 else 0)
+            temp_actual_N_E = actual_N_E + (1 if v.task_type == 'eMBB' and legal_actions[i] == 0 else 0)
+            
+            W_U, W_E = 4.0, 1.0
+            total_weight_actual = max(1e-9, temp_actual_N_U * W_U + temp_actual_N_E * W_E)
             if v.task_type == 'URLLC':
-                actual_alloc_B = self.B / max(1, actual_N_U)
+                actual_alloc_B = self.B * (W_U / total_weight_actual)
             else:
-                actual_alloc_B = self.B / max(1, actual_N_U + actual_N_E)
+                actual_alloc_B = self.B * (W_E / total_weight_actual)
             R_samples_actual = actual_alloc_B * np.log2(1 + sinr_samples_actual)
             
             if v.task_type == 'URLLC':
