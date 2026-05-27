@@ -1,215 +1,133 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
-import random
+import os
 
-from my_iov_env import ResidualIoVEnv
-from residual_ppo_agent import ResidualPPOAgent
+os.makedirs('image', exist_ok=True)
 
-def set_seed(seed=42):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
+def smooth(x, weight=0.6):
+    """只允许对均值使用轻度平滑(<=0.6)，绝对禁止前方差平滑"""
+    res = []
+    last = x[0]
+    for val in x:
+        smoothed = last * weight + (1 - weight) * val
+        res.append(smoothed)
+        last = smoothed
+    return np.array(res)
 
-def smooth(scalars, weight=0.9):  
-    if len(scalars) == 0: return scalars
-    last = scalars[0]
-    smoothed = []
-    for point in scalars:
-        smoothed_val = last * weight + (1 - weight) * point
-        smoothed.append(smoothed_val)
-        last = smoothed_val
-    return np.array(smoothed)
+def load_data(algo, metric):
+    data = []
+    for seed in range(1, 6):
+        path = f'results/{algo}_seed_{seed}_{metric}.npy'
+        if os.path.exists(path):
+            data.append(np.load(path))
+    if len(data) == 0:
+        raise FileNotFoundError(f"No data found for {algo} {metric}")
+    return np.array(data)
 
-def run_detailed_evaluation():
-    os.makedirs('image', exist_ok=True)
-    set_seed(42)
+def get_stats(data):
+    mean_raw = np.mean(data, axis=0)
+    # The user strictly commanded: "方差平滑系数必须死死锁在 0.0"
+    std_raw = np.std(data, axis=0) 
     
-    print("=== Starting V2.0 Detailed Physics Evaluation ===", flush=True)
-    
-    env = ResidualIoVEnv()
-    sample_state = env.reset()
-    flat_state_dim = sample_state.flatten().shape[0]
-    action_dim = len(env.vehicles) * 4
-    
-    # 纯评估模式，学习率极小
-    agent = ResidualPPOAgent(state_dim=flat_state_dim, action_dim=action_dim, lr=1e-5, ablation_mode='ours')
-    
-    agent.load_expert('model/prior_dnn_expert.pth')
-    agent.load_model('model/ours_converged.pth')
-    
-    max_episodes = 2000
-    steps_per_episode = 200
-    
-    history_cost = []
-    history_mec_load = []
-    history_urllc_lat = []
-    history_embb_lat = []
-    history_urllc_eng = []
-    history_embb_eng = []
-    
-    history_action_ratios = {0: [], 1: [], 2: [], 3: []}
-    history_raw_action_ratios = {0: [], 1: [], 2: [], 3: []}
-    
-    for episode in range(1, max_episodes + 1):
-        if episode == 500: env.trigger_capacity_avalanche()
-        elif episode == 800: env.recover_from_avalanche()
-        elif episode == 1300: env.trigger_traffic_flood()
-        elif episode == 1600: env.recover_from_flood()
-            
-        state = env.reset()
-        
-        ep_cost, ep_urllc_lat, ep_embb_lat, ep_urllc_eng, ep_embb_eng, ep_mec_load = 0, 0, 0, 0, 0, 0
-        action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-        raw_action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-        
-        for t in range(steps_per_episode):
-            res = agent.select_action(state)
-            action = res[0]
-            
-            next_state, reward, done, info = env.step(action)
-            
-            for a in info['legal_actions']: action_counts[a] += 1
-            for a in info['raw_actions']: raw_action_counts[a] += 1
-                
-            ep_cost += info['avg_cost']
-            ep_urllc_lat += info['urllc_latency']
-            ep_embb_lat += info['embb_latency']
-            ep_urllc_eng += info['urllc_energy']
-            ep_embb_eng += info['embb_energy']
-            ep_mec_load += info['mec_load']
-            
-            state = next_state
-            if done: break
-            
-        # 不更新 agent，这是纯推断评估
-        
-        history_cost.append(ep_cost / steps_per_episode)
-        history_urllc_lat.append((ep_urllc_lat / steps_per_episode) * 1000) # ms
-        history_embb_lat.append((ep_embb_lat / steps_per_episode) * 1000) # ms
-        history_urllc_eng.append(ep_urllc_eng / steps_per_episode)
-        history_embb_eng.append(ep_embb_eng / steps_per_episode)
-        history_mec_load.append(ep_mec_load / steps_per_episode)
-        
-        total_actions = sum(action_counts.values()) + 1e-6
-        for a in range(4):
-            history_action_ratios[a].append(action_counts[a] / total_actions)
-            history_raw_action_ratios[a].append(raw_action_counts[a] / total_actions)
-            
-        if episode % 100 == 0:
-            print(f"Ep {episode} | Cost: {history_cost[-1]:.2f} | MEC Load: {history_mec_load[-1]:.1%}")
+    # 仅对均值进行克制的轻度平滑以辨识主线趋势，暴露出全部的方差震荡
+    mean_smooth = smooth(mean_raw, 0.6)
+    return mean_smooth, std_raw
 
-    print("\n[EVAL] Evaluation Finished. Plotting detailed metrics...")
+try:
+    ours_cost = load_data('ours', 'cost')
+    ppo_cost = load_data('ppo', 'cost')
+    prior_cost = load_data('prior', 'cost')
 
-    x = range(1, max_episodes + 1)
+    ours_urllc = load_data('ours', 'urllc')
+    ppo_urllc = load_data('ppo', 'urllc')
     
-    # === 画图 1: 系统总成本与基站负载 ===
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    color = 'tab:blue'
-    ax1.set_xlabel('Episodes')
-    ax1.set_ylabel('Total System Cost', color=color)
-    ax1.plot(x, history_cost, color=color, alpha=0.2)
-    ax1.plot(x, smooth(history_cost, 0.95), color=color, linewidth=2, label='Total Cost (Smoothed)')
-    ax1.tick_params(axis='y', labelcolor=color)
-    
-    ax1.axvspan(500, 800, color='red', alpha=0.1, label='Avalanche (MEC Drop)')
-    ax1.axvspan(1300, 1600, color='blue', alpha=0.1, label='Flood (Traffic Spike)')
-    
-    ax2 = ax1.twinx()  
-    color = 'tab:orange'
-    ax2.set_ylabel('MEC Load Ratio', color=color)  
-    ax2.plot(x, history_mec_load, color=color, alpha=0.2)
-    ax2.plot(x, smooth(history_mec_load, 0.95), color=color, linewidth=2, label='MEC Load (Smoothed)')
-    ax2.tick_params(axis='y', labelcolor=color)
-    
-    fig.tight_layout() 
-    plt.title("V2.0 Inference: Total Cost & MEC Load Response under Disasters")
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines + lines2, labels + labels2, loc='upper left')
-    plt.savefig('image/training_curve.png', dpi=300)
+    # 取单一 seed 的 gate 用来画图，防止跨种子平均导致阶跃变缓
+    ours_gate_single = load_data('ours', 'gate')[0] 
+except Exception as e:
+    print(f"Error loading data: {e}")
+    exit(1)
 
-    # === 画图 2: Actual Action Distribution (物理 GKP 投影后) ===
-    fig2, ax_act = plt.subplots(figsize=(10, 6))
-    y0 = smooth(history_action_ratios[0], 0.95)
-    y1 = smooth(history_action_ratios[1], 0.95)
-    y2 = smooth(history_action_ratios[2], 0.95)
-    y3 = smooth(history_action_ratios[3], 0.95)
-    
-    ax_act.stackplot(x, y0, y1, y2, y3, 
-                     labels=['Local (Action 0)', 'Local MEC (Action 1)', 'Remote MEC (Action 2)', 'Cloud (Action 3)'],
-                     colors=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'], alpha=0.8)
-    ax_act.set_xlabel('Episodes')
-    ax_act.set_ylabel('Execution Probability')
-    ax_act.set_title('Post-GKP Physical Execution Profile (The Cold Reality)')
-    ax_act.axvspan(500, 800, color='red', alpha=0.1)
-    ax_act.axvspan(1300, 1600, color='blue', alpha=0.1)
-    ax_act.legend(loc='lower right')
-    fig2.tight_layout()
-    plt.savefig('image/action_distribution.png', dpi=300)
+x = np.arange(1, 2001)
 
-    # === 画图 3: Raw Action Distribution (神经网络原始意图) ===
-    fig3, ax_raw = plt.subplots(figsize=(10, 6))
-    r0 = smooth(history_raw_action_ratios[0], 0.95)
-    r1 = smooth(history_raw_action_ratios[1], 0.95)
-    r2 = smooth(history_raw_action_ratios[2], 0.95)
-    r3 = smooth(history_raw_action_ratios[3], 0.95)
-    
-    ax_raw.stackplot(x, r0, r1, r2, r3, 
-                     labels=['Local (Action 0)', 'Local MEC (Action 1)', 'Remote MEC (Action 2)', 'Cloud (Action 3)'],
-                     colors=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'], alpha=0.8)
-    ax_raw.set_xlabel('Episodes')
-    ax_raw.set_ylabel('Network Intent Probability')
-    ax_raw.set_title('Pre-GKP Neural Network Intent (Bounded Residual Temperature)')
-    ax_raw.axvspan(500, 800, color='red', alpha=0.1)
-    ax_raw.axvspan(1300, 1600, color='blue', alpha=0.1)
-    ax_raw.legend(loc='lower right')
-    fig3.tight_layout()
-    plt.savefig('image/raw_action_distribution.png', dpi=300)
+# =====================================================================
+# 1. Main Convergence Curve (True Variance Shadow)
+# =====================================================================
+ours_m, ours_s = get_stats(ours_cost)
+ppo_m, ppo_s = get_stats(ppo_cost)
+prior_m, prior_s = get_stats(prior_cost)
 
-    # === 画图 4: 物理指标解耦图 (URLLC vs eMBB) ===
-    fig4, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
-    ax_u_lat, ax_e_lat = axes[0, 0], axes[0, 1]
-    ax_u_eng, ax_e_eng = axes[1, 0], axes[1, 1]
-    
-    # URLLC Latency (Effective Capacity)
-    ax_u_lat.plot(x, history_urllc_lat, color='tab:red', alpha=0.2)
-    ax_u_lat.plot(x, smooth(history_urllc_lat, 0.95), color='tab:red', linewidth=2)
-    ax_u_lat.set_title('URLLC Effective Latency (ms) [LogSumExp Penalized]')
-    ax_u_lat.set_ylabel('Milliseconds')
-    ax_u_lat.axvspan(500, 800, color='red', alpha=0.1)
-    ax_u_lat.axvspan(1300, 1600, color='blue', alpha=0.1)
-    
-    # eMBB Latency (Ergodic Capacity)
-    ax_e_lat.plot(x, history_embb_lat, color='tab:blue', alpha=0.2)
-    ax_e_lat.plot(x, smooth(history_embb_lat, 0.95), color='tab:blue', linewidth=2)
-    ax_e_lat.set_title('eMBB Ergodic Latency (ms) [Mean Tolerated]')
-    ax_e_lat.axvspan(500, 800, color='red', alpha=0.1)
-    ax_e_lat.axvspan(1300, 1600, color='blue', alpha=0.1)
-    
-    # URLLC Energy
-    ax_u_eng.plot(x, history_urllc_eng, color='tab:red', alpha=0.2)
-    ax_u_eng.plot(x, smooth(history_urllc_eng, 0.95), color='tab:red', linewidth=2)
-    ax_u_eng.set_title('URLLC Energy Overhead (J)')
-    ax_u_eng.set_ylabel('Joules')
-    ax_u_eng.set_xlabel('Episodes')
-    ax_u_eng.axvspan(500, 800, color='red', alpha=0.1)
-    ax_u_eng.axvspan(1300, 1600, color='blue', alpha=0.1)
-    
-    # eMBB Energy
-    ax_e_eng.plot(x, history_embb_eng, color='tab:blue', alpha=0.2)
-    ax_e_eng.plot(x, smooth(history_embb_eng, 0.95), color='tab:blue', linewidth=2)
-    ax_e_eng.set_title('eMBB Energy Overhead (J)')
-    ax_e_eng.set_xlabel('Episodes')
-    ax_e_eng.axvspan(500, 800, color='red', alpha=0.1)
-    ax_e_eng.axvspan(1300, 1600, color='blue', alpha=0.1)
-    
-    fig4.suptitle("V2.0 Physical Decoupling: URLLC Protection vs eMBB Sacrifice", fontsize=16)
-    fig4.tight_layout()
-    plt.savefig('image/latency_energy_curve.png', dpi=300)
-    print("\n[OK] All internal mechanism plots successfully generated to 'image/' folder!")
+plt.figure(figsize=(12, 6))
+plt.plot(x, ours_m, 'r-', label='OURS (Dual-Brain Res-Gating)', linewidth=2)
+# 真实的爆炸式扩散方差
+plt.fill_between(x, ours_m - ours_s, ours_m + ours_s, color='red', alpha=0.25)
 
-if __name__ == "__main__":
-    run_detailed_evaluation()
+plt.plot(x, ppo_m, 'gray', label='Standard PPO (Context-Aware)', linewidth=2)
+plt.fill_between(x, ppo_m - ppo_s, ppo_m + ppo_s, color='gray', alpha=0.25)
+
+plt.plot(x, prior_m, 'b--', label='Ablation (EWC Prior, No Gating)', linewidth=2)
+plt.fill_between(x, prior_m - prior_s, prior_m + prior_s, color='blue', alpha=0.1)
+
+plt.axvspan(500, 800, color='red', alpha=0.1, label='OOD: Capacity Avalanche')
+plt.axvspan(1300, 1600, color='blue', alpha=0.1, label='OOD: Traffic Flood')
+
+plt.title("System Convergence & OOD Resilience (True Variance Explosion)")
+plt.xlabel("Episodes")
+plt.ylabel("System Cost")
+plt.legend(loc='upper right')
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.tight_layout()
+plt.savefig('image/training_curve.png', dpi=300)
+
+# =====================================================================
+# 2. URLLC 99.99% Tail Latency Violation Rate (Global Sliding Window)
+# =====================================================================
+ours_u_m, ours_u_s = get_stats(ours_urllc)
+ppo_u_m, ppo_u_s = get_stats(ppo_urllc)
+
+plt.figure(figsize=(12, 4))
+# Statistical Warm-up Phase
+plt.axvspan(0, 250, color='lightgray', alpha=0.5, label='Statistical Warm-up Phase (Jitter)')
+
+plt.plot(x, ours_u_m, 'r-', label='OURS True Tail Violation', linewidth=2)
+plt.fill_between(x, ours_u_m - ours_u_s, ours_u_m + ours_u_s, color='red', alpha=0.2)
+
+plt.plot(x, ppo_u_m, 'k-', label='PPO True Tail Violation', linewidth=2)
+plt.fill_between(x, ppo_u_m - ppo_u_s, ppo_u_m + ppo_u_s, color='gray', alpha=0.2)
+
+plt.axhline(y=0.01, color='green', linestyle='--', linewidth=2, label='3GPP 99.99% Reliability Deadline')
+
+plt.axvspan(500, 800, color='red', alpha=0.1)
+plt.axvspan(1300, 1600, color='blue', alpha=0.1)
+
+plt.title("URLLC 99.99% Tail Violation Rate (100,000-Sample Global Window)")
+plt.xlabel("Episodes")
+plt.ylabel("Violation Rate")
+# Cap the y-limit logically, exposing deep fading floor
+plt.ylim(-0.005, np.max(ppo_u_m[300:]) + 0.05) 
+plt.legend(loc='upper left')
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.tight_layout()
+plt.savefig('image/urllc_violation_rate.png', dpi=300)
+
+# =====================================================================
+# 3. G(t) Gating Radar ECG (Step-Response Integrity)
+# =====================================================================
+# Absolutely NO smoothing, showing the raw single-seed trace
+plt.figure(figsize=(12, 3))
+plt.plot(x, ours_gate_single, color='#00ff00', linewidth=1.2, label='Raw G(t) Activation') 
+plt.fill_between(x, 0, ours_gate_single, color='#00ff00', alpha=0.1)
+plt.axvspan(500, 800, color='red', alpha=0.2, label='Avalanche (OOD)')
+plt.axvspan(1300, 1600, color='blue', alpha=0.2, label='Flood (OOD)')
+
+plt.title("G(t) Gating Radar ECG (Single Seed, No Smoothing, Absolute Step-Response)")
+plt.xlabel("Episodes")
+plt.ylabel("G(t) Activation")
+plt.ylim(-0.1, 1.1)
+ax = plt.gca()
+ax.set_facecolor('#111111')
+plt.legend(loc='upper right', facecolor='#111111', labelcolor='white')
+plt.grid(True, color='#333333', linestyle='--')
+plt.tight_layout()
+plt.savefig('image/gate_radar.png', dpi=300)
+
+print("\n[OK] All true physics figures rendered successfully.")

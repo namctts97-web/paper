@@ -356,7 +356,7 @@ class ResidualIoVEnv(gym.Env):
             "avg_latency": total_latency / len(self.vehicles),
             "avg_energy": total_energy / len(self.vehicles),
             "urllc_latency": urllc_latency / max(1, urllc_count),
-            "urllc_violation_rate": sum(1 for lat in self.current_step_urllc_latencies if lat > 0.003) / max(1, len(self.current_step_urllc_latencies)),
+            "raw_urllc_latencies": self.current_step_urllc_latencies,
             "embb_latency": embb_latency / max(1, embb_count),
             "urllc_energy": urllc_energy / max(1, urllc_count),
             "embb_energy": embb_energy / max(1, embb_count),
