@@ -20,9 +20,9 @@ class IoVEnvV3(gym.Env):
         # System constraints & physical parameters
         self.B = 20e6  # 20 MHz Total Bandwidth
         
-        # Noise power: -114 dBm/MHz -> 20MHz is approx -101 dBm
-        # Linear scale (Watts)
-        self.noise_power = 10 ** ((-114 - 30) / 10) * 20e6
+        # Noise power: Thermal noise is -174 dBm/Hz.
+        # Linear scale (Watts): 10^((-174 - 30) / 10) * B
+        self.noise_power = 10 ** ((-174.0 - 30.0) / 10.0) * self.B
         
         self.p_ue_dbm = 23 # 23 dBm UE transmit power
         self.p_ue = 10 ** ((self.p_ue_dbm - 30) / 10) # Watts
@@ -112,7 +112,10 @@ class IoVEnvV3(gym.Env):
             zonal_I += I_i
             
         # ZITD_norm is a global macroscopic indicator (average zonal congestion normalized by noise)
-        ZITD_norm = (zonal_I / self.num_vehicles) / self.noise_power
+        # Apply a generic macro path loss factor (e.g. 1e-13) to convert raw Tx power to received background interference
+        generic_path_loss = 1e-13
+        zonal_I_received = (zonal_I / self.num_vehicles) * generic_path_loss
+        ZITD_norm = zonal_I_received / self.noise_power
         
         # MEC Load computation (total demand vs capacity)
         mec_demand = sum(v['D_i'] for v in self.vehicles)
@@ -173,10 +176,11 @@ class IoVEnvV3(gym.Env):
         alloc_B_eMBB = self.B * (self.W_E / total_weight) if N_E > 0 else 0.0
         
         # 3. Inter-Cell Interference (ICI) formulation
-        # Academic Resolution: OFDMA guarantees zero Intra-Cell Interference. 
-        # ZITD (scaled) is used explicitly as ICI from neighboring out-of-cell vehicles.
-        # We assume 10% of global transmitting power acts as background ICI.
-        ICI = 0.1 * sum(self.p_ue for _ in offloading_indices)
+        # 物理学修正：ICI 是经过严重路径损耗后的到达功率，通常与热噪声在同一量级。
+        # 我们利用 ZITD_norm（区域干扰密度）作为系数，建立环境拥塞对物理层信道的实质影响。
+        # 假设基准状态下，ICI 约为热噪声的 1 到 2 倍；发生空间数据洪峰（OOD）时，倍数上升。
+        ICI_scaling_factor = 1.0 + 0.1 * self.current_ZITD
+        ICI = self.noise_power * ICI_scaling_factor
         
         # 4. Heterogeneous Cost Computation
         total_cost = 0.0
@@ -259,6 +263,86 @@ class IoVEnvV3(gym.Env):
         
         return self._get_obs(), reward, done, info
         
+    def evaluate_actions(self, actions):
+        """
+        无状态评估接口 (Stateless Evaluation)
+        供外部启发式求解算法调用，仅返回该动作组合下的总代价（Cost）。
+        不改变内部任何状态（坐标、衰落），保证启发式算法的 Fitness 函数与环境 100% 同构。
+        """
+        offloading_indices = [i for i, a in enumerate(actions) if a > 0]
+        N_U = sum(1 for i in offloading_indices if self.vehicles[i]['is_urllc'] == 1)
+        N_E = sum(1 for i in offloading_indices if self.vehicles[i]['is_urllc'] == 0)
+        
+        total_weight = max(1e-9, N_U * self.W_U + N_E * self.W_E)
+        alloc_B_URLLC = self.B * (self.W_U / total_weight) if N_U > 0 else 0.0
+        alloc_B_eMBB = self.B * (self.W_E / total_weight) if N_E > 0 else 0.0
+        
+        ICI_scaling_factor = 1.0 + 0.1 * getattr(self, 'current_ZITD', 1.0)
+        ICI = self.noise_power * ICI_scaling_factor
+        
+        total_cost = 0.0
+        
+        for i, v in enumerate(self.vehicles):
+            a_i = actions[i]
+            
+            d_i = max(10.0, math.sqrt((v['x'] - self.grid_size/2)**2 + (v['y'] - self.grid_size/2)**2))
+            # 为了无状态纯粹性，这里忽略正态分布随机阴影，或者使用均值，保证评估稳定性
+            pl_db = 128.1 + 37.6 * math.log10(d_i / 1000.0) 
+            pl_linear = 10**(-pl_db/10)
+            
+            signal_power = self.p_ue * (v['h_t']**2) * pl_linear
+            
+            if a_i > 0:
+                alloc_B = alloc_B_URLLC if v['is_urllc'] == 1 else alloc_B_eMBB
+                sinr = signal_power / (self.noise_power + ICI)
+                rate = alloc_B * math.log2(1 + sinr)
+            else:
+                rate = 1e-9 
+                
+            rate = max(1.0, rate)
+            
+            T_trans, T_exec = 0.0, 0.0
+            E_trans, E_exec = 0.0, 0.0
+            k_energy = 1e-28
+            
+            E_max = k_energy * (v['f_local']**2) * v['D_i']
+            if E_max <= 0: E_max = 1e-10
+            
+            if a_i == 0: 
+                T_exec = v['D_i'] / v['f_local']
+                E_exec = k_energy * (v['f_local']**2) * v['D_i']
+            elif a_i == 1: 
+                T_trans = v['U_i'] / rate
+                actual_N_MEC = sum(1 for a in actions if a == 1)
+                f_assigned = self.f_mec / max(1, actual_N_MEC)
+                T_exec = v['D_i'] / f_assigned
+                E_trans = self.p_ue * T_trans
+            elif a_i == 2: 
+                T_trans = v['U_i'] / rate + v['U_i'] / self.r_eo_base + 0.005
+                actual_N_Off = sum(1 for a in actions if a == 2)
+                f_assigned = self.f_mec_base / max(1, actual_N_Off)
+                T_exec = v['D_i'] / f_assigned
+                E_trans = self.p_ue * (v['U_i'] / rate)
+            elif a_i == 3: 
+                T_trans = v['U_i'] / rate + v['U_i'] / self.r_ec + 0.02 # 均值
+                T_exec = v['D_i'] / self.f_cloud
+                E_trans = self.p_ue * (v['U_i'] / rate)
+                
+            T_i = T_trans + T_exec
+            E_i = E_trans + E_exec
+            
+            if v['is_urllc'] == 1:
+                alpha, beta, gamma = 10.0, 10.0, 0.01
+                x = (T_i - v['t_max']) / v['t_max']
+                smooth_max = x if (beta * x) > 50 else (1.0 / beta) * math.log(1.0 + math.exp(beta * x))
+                cost = alpha * math.asinh(smooth_max) + gamma * (E_i / E_max)
+            else:
+                cost = 1.0 * (T_i / v['t_max']) + 1.0 * (E_i / E_max)
+                
+            total_cost += cost
+            
+        return total_cost
+
     def trigger_avalanche(self):
         self.is_compute_avalanche = True
     def trigger_flood(self):
