@@ -6,6 +6,7 @@ from torch.distributions import Categorical
 import numpy as np
 import os
 import random
+import math
 
 class RunningMeanStd(nn.Module):
     """
@@ -104,8 +105,8 @@ class Residual_ActorCritic(nn.Module):
         self.action_head = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, action_dim),
-            nn.Tanh()
+            nn.Linear(64, action_dim)
+            # [学术修正] 战术B：废除 Tanh 枷锁，允许右脑爆发出不受限的无界实数纠偏力量！
         )
         nn.init.orthogonal_(self.action_head[-2].weight, gain=0.01)
         nn.init.constant_(self.action_head[-2].bias, 0.0)
@@ -132,8 +133,10 @@ class Residual_ActorCritic(nn.Module):
         delta_logits = delta_logits.view(logits_prior.size())
         
         # [学术修正] 无监督物理异常检测 (使用白化后的状态)
-        reconstructed, norm_state = self.autoencoder(state)
-        recon_error = torch.mean((norm_state - reconstructed) ** 2, dim=-1, keepdim=True)
+        # 【终极封印】AE 必须是冷酷的旁观者！在强化学习的探索中绝对禁止计算图流动
+        with torch.no_grad():
+            reconstructed, norm_state = self.autoencoder(state)
+            recon_error = torch.mean((norm_state - reconstructed) ** 2, dim=-1, keepdim=True)
         
         # [学术修正] 基础残差底噪 (Base Residual Floor): 解决“次优性悖论”
         # 即使在正常环境，门控也维持 0.2 的底噪，允许 RL 微调 prior，消除启发式算法的最优性间隙
@@ -143,10 +146,7 @@ class Residual_ActorCritic(nn.Module):
             # [消融实验 B] 强制完全开启残差，破坏冷启动
             gate = torch.ones_like(gate)
         
-        # [代数坍缩修正] 绝对禁止在 forward_actor 内部再次叠加 logits_prior！
-        # 但我们使用 LayerNorm 保护 prior 的拓扑熵，防止右脑残差暴力覆写
-        # 返回被 gate 动态抑制的残差增量
-        # 返回被 gate 动态抑制的残差增量
+        # 直接返回纯净的 delta_logits 和 gate，组合逻辑交由外部通过 T=2.0 和 K=10.0 严格控制
         adaptive_scale = self.R_max * torch.sigmoid(self.alpha)
         # 注意：此处输出 delta_logits，外层的 PPO agent 会执行 L_final = L_prior + delta (严格加法)
         return adaptive_scale * gate * delta_logits, gate, recon_error
@@ -197,14 +197,13 @@ class ResidualPPOAgent:
                 self.ewc_fisher[n] = torch.ones_like(p) # 使用 L2 正则近似 Empirical Fisher 以确保稳定
 
     def update_ewc(self):
-        """灾难发生时，计算 EWC 的 Fisher 矩阵保护 Prior 知识"""
-        if len(self.ood_memory) < 100:
+        """[学术修正] EWC 采样重构：绝不在灾难态计算 Fisher！只在平稳期保护左脑知识"""
+        if len(self.buffer) < 100:
             return
             
-        print("\n[EWC] Computing Fisher Information Matrix to freeze disaster memory...", flush=True)
-        # [学术修正] 扩大 Fisher 采样规模，降低 Empirical Fisher 的高维方差
-        sample_size = min(1000, len(self.ood_memory))
-        sampled = random.sample(self.ood_memory, sample_size)
+        print("\n[EWC] Computing Fisher Information Matrix to freeze NORMAL memory...", flush=True)
+        sample_size = min(1000, len(self.buffer))
+        sampled = random.sample(self.buffer, sample_size)
         
         self.ewc_anchor = {}
         self.ewc_fisher = {}
@@ -214,8 +213,9 @@ class ResidualPPOAgent:
                 self.ewc_fisher[n] = torch.zeros_like(p)
         
         for s in sampled:
-            s_state = s[0].unsqueeze(0).to(self.device)
-            s_action = s[1].unsqueeze(0).to(self.device)
+            s_state = torch.FloatTensor(s[0]).unsqueeze(0).to(self.device)
+            # s[1] (action) might be discrete, convert carefully
+            s_action = torch.FloatTensor(s[1]).unsqueeze(0).to(self.device)
             
             self.optimizer.zero_grad()
             
@@ -224,8 +224,10 @@ class ResidualPPOAgent:
                 logits_prior = self.prior_net(prior_x)
                 logits_prior = torch.clamp(logits_prior, min=-5.0, max=5.0)
                 
-            delta_logits, _, _ = self.residual_net.forward_actor(s_state, logits_prior)
-            logits_final = logits_prior + self.residual_scale * delta_logits
+            delta_logits, gate, _ = self.residual_net.forward_actor(s_state, logits_prior)
+            # [学术修正] 动态温度门控：正常态 T=1.0 (绝对听从左脑)；灾难态 T=3.0 (强制软化探索)
+            T_dynamic = 1.0 + 2.0 * gate
+            logits_final = (logits_prior.detach() / T_dynamic) + gate * delta_logits
             logits_final = logits_final.view(-1, self.num_vehicles, 4)
             
             dist = Categorical(logits=logits_final)
@@ -270,8 +272,9 @@ class ResidualPPOAgent:
             elif self.ablation_mode == 'ppo':
                 logits_final = delta_logits.clone() 
             else:
-                # [学术修正] 放弃凸组合，采用严格加法，允许 RL 始终在 prior 基础上微调
-                logits_final = logits_prior + delta_logits
+                # [学术修正] 动态温度门控：正常态 T=1.0 (绝对听从左脑)；灾难态 T=3.0 (强制软化探索)
+                T_dynamic = 1.0 + 2.0 * gate
+                logits_final = (logits_prior.detach() / T_dynamic) + gate * delta_logits
             
             logits_final = logits_final.view(-1, self.num_vehicles, 4)
             
@@ -306,7 +309,6 @@ class ResidualPPOAgent:
         returns = torch.FloatTensor(returns).to(self.device)
         
         if self.ablation_mode == 'ablation_hardclip':
-            # [消融实验 A] 关闭 Return Normalization，验证价值饥饿
             normalized_returns = returns
         else:
             # [学术修正] 根治价值饥饿 (Value Starvation)
@@ -339,7 +341,7 @@ class ResidualPPOAgent:
             delta_logits, gate, recon_error = self.residual_net.forward_actor(states, logits_prior)
             
             # forward_actor 已经包含了 self.alpha 和 gate
-            logits_final = logits_prior + delta_logits
+            logits_final = logits_prior.detach() + delta_logits
             logits_final = logits_final.view(-1, self.num_vehicles, 4)
             
             values = self.residual_net.critic(states.view(states.size(0), -1)).squeeze()
@@ -386,8 +388,9 @@ class ResidualPPOAgent:
                     s_logits_prior = self.prior_net(s_states)
                     s_logits_prior = torch.clamp(s_logits_prior, min=-5.0, max=5.0)
                 
-                s_delta_logits, _, _ = self.residual_net.forward_actor(s_states, s_logits_prior)
-                s_logits_final = s_logits_prior + s_delta_logits
+                s_delta_logits, s_gate, _ = self.residual_net.forward_actor(s_states, s_logits_prior)
+                # forward_actor 已经包含了自适应 alpha 杠杆
+                s_logits_final = s_logits_prior.detach() + s_delta_logits
                 s_logits_final = s_logits_final.view(-1, self.num_vehicles, 4)
                 
                 s_dist = Categorical(logits=s_logits_final)
@@ -403,23 +406,12 @@ class ResidualPPOAgent:
                     if n in self.ewc_fisher:
                         loss_ewc += (self.ewc_fisher[n] * (p - self.ewc_anchor[n]) ** 2).sum()
                 if loss_ewc > 0:
-                    # [学术修正] 动态 EWC 阻尼：灾难越严重(Gate越大)，惩罚越小
-                    lambda_dynamic = self.lambda_ewc * (1.0 - mean_gate)
+                    # [学术修正] 动态 EWC 阻尼：灾难越严重(Gate越大)，惩罚指数级衰减，允许绝地求生
+                    lambda_dynamic = self.lambda_ewc * math.exp(-10.0 * mean_gate)
                     loss_ewc = lambda_dynamic * loss_ewc
                 
-            normal_mask = (initial_adv <= threshold).unsqueeze(-1)
-            recon_error_flat = recon_error.view(-1, 1)
-            if normal_mask.sum() > 0:
-                loss_ae = recon_error_flat[normal_mask].mean() * 10.0
-            else:
-                loss_ae = torch.tensor(0.0).to(self.device)
-                
-            # TODO: Concept Drift Adaptation Handler
-            # if mean_gate > 0.8 and disaster_duration > T_drift:
-            #     # trigger ultra-slow momentum update for AE (EMA: tau=0.0001)
-            #     pass
-                
-            loss_total = loss_ppo.mean() + loss_cl + loss_ewc + loss_ae
+            # [学术修正]：彻底剥离 AE 损失！AE 已经在 Warmup 阶段完美收敛，现在必须被冻结！
+            loss_total = loss_ppo.mean() + loss_cl + loss_ewc
             
             self.optimizer.zero_grad()
             loss_total.backward()

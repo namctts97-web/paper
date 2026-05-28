@@ -17,7 +17,7 @@ def train_bc():
     print(f"Using Device: {device}")
     print(f"=========================================")
     
-    data_path = 'data/expert_data_v3.npy'
+    data_path = 'data/expert_dataset_v3_clean.npy'
     if not os.path.exists(data_path):
         print(f"Error: {data_path} not found!")
         return

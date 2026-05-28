@@ -14,7 +14,8 @@ def train_residual():
     state_dim = env.state_dim
     action_dim = env.num_vehicles * 4
     
-    agent = ResidualPPOAgent(state_dim=state_dim, action_dim=action_dim, lr=3e-4, gamma=0.99, K_epochs=4)
+    # [学术映射] 降低 lr 至 1e-4，保证 Lipschitz 连续性条件下的平滑更新，防止策略崩溃
+    agent = ResidualPPOAgent(state_dim=state_dim, action_dim=action_dim, lr=1e-4, gamma=0.99, K_epochs=4)
     
     # 强制进行 EWC 和门控逻辑的初始化
     prior_path = 'model/prior_dnn_expert.pth'
@@ -49,7 +50,7 @@ def train_residual():
         optimizer_ae.step()
     print(f"AE 预热完成！正常态的基准重构误差已被成功压制到: {loss.item():.6f}")
 
-    num_episodes = 20 # 演示用，进行20个高强度灾难测试 Episode
+    num_episodes = 1000 # [终极试炼] 拉满 1000 个高强度灾难测试 Episode，榨干算力！
     steps_per_ep = 200
     update_timestep = 400 # 2个 Episode 更新一次
     time_step = 0
@@ -100,7 +101,6 @@ def train_residual():
             # RL 代理 PPO 更新 & AE/EWC 联合训练
             if time_step % update_timestep == 0:
                 loss_mse, loss_entropy = agent.update()
-                agent.update_ewc()
                 
         # 统计本回合数据的宏观表现
         avg_normal_gate = np.mean(gate_history_normal)
@@ -109,7 +109,7 @@ def train_residual():
         print(f"Ep {ep:02d} | Avg Normal Gate: {avg_normal_gate:.4f} | Avg OOD Gate: {avg_ood_gate:.4f} | Total Cost: {ep_cost:.2f}")
         
     print("\n联合训练大功告成！")
-    save_path = 'model/residual_ppo_ours.pth'
+    save_path = 'model/ours_converged.pth'
     agent.save_model(save_path)
     print(f"网络权重成功固化并保存在: {save_path}")
 
